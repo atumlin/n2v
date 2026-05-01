@@ -10,5 +10,18 @@ from n2v.utils.model_loader import load_onnx, load_pytorch
 from n2v.utils.load_vnnlib import load_vnnlib
 from n2v.utils.falsify import falsify
 from n2v.utils.model_preprocessing import fuse_batchnorm
+from n2v.utils.gnn_loader import load_gnn_mat, GCNModel, GCNLayerSpec, NormStats
 
-__all__ = ["solve_lp", "solve_lp_batch", "load_onnx", "load_pytorch", "load_vnnlib", "falsify", "fuse_batchnorm"]
+__all__ = [
+    "solve_lp",
+    "solve_lp_batch",
+    "load_onnx",
+    "load_pytorch",
+    "load_vnnlib",
+    "falsify",
+    "fuse_batchnorm",
+    "load_gnn_mat",
+    "GCNModel",
+    "GCNLayerSpec",
+    "NormStats",
+]

@@ -10,6 +10,7 @@ rather than directly.
 
 from n2v.nn.layer_ops import linear_reach
 from n2v.nn.layer_ops import relu_reach
+from n2v.nn.layer_ops import gcn_reach
 from n2v.nn.layer_ops import flatten_reach
 from n2v.nn.layer_ops import conv2d_reach
 from n2v.nn.layer_ops import maxpool2d_reach
@@ -37,5 +38,6 @@ __all__ = [
     "leakyrelu_reach",
     "sigmoid_reach",
     "tanh_reach",
+    "gcn_reach",
     "reach_layer",
 ]
