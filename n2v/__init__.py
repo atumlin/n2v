@@ -10,7 +10,7 @@ Translated from the original MATLAB NNV tool by the VeriVital research group.
 __version__ = "0.1.0"
 __author__ = "NNV Team"
 
-from n2v.sets import Star, Zono, Box, ImageStar, ImageZono, Hexatope, Octatope, HalfSpace, ProbabilisticBox
+from n2v.sets import Star, Zono, Box, ImageStar, ImageZono, Hexatope, Octatope, HalfSpace, ProbabilisticBox, GraphStar
 from n2v.nn import NeuralNetwork
 from n2v import utils
 from n2v import probabilistic
@@ -26,6 +26,7 @@ __all__ = [
     "Hexatope",
     "Octatope",
     "HalfSpace",
+    "GraphStar",
     "NeuralNetwork",
     "utils",
     "probabilistic",
