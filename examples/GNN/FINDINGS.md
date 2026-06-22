@@ -27,9 +27,119 @@ Four commits on `gnn-integration`:
 | ReLU on GraphStar | ✓ | ✓ | ✓ | ✓ |
 | Sum / mean pool | ✓ | ✓ (exact) | ✓ | indirect (via stack) |
 | Linear readout | reuses existing `linear_reach` | reuses | reuses | indirect |
-| GINE / HuGINE | — | — | — | — |
-| SAGEConv | — | — | — | — |
-| `reachSubgraph` (k-hop) | — | — | — | — |
+| SAGEConv | ✓ | ✓ (exact) | ✓ | ✓ |
+| GINE / HuGINE (node-only) | ✓ | ✓ | ✓ | ✓ |
+| `reachSubgraph` (k-hop) | ✓ | ✓ (exact per target) | ✓ | indirect (= full reach) |
+| GINE edge-perturbation | ✓ | ✓ | ✓ | — |
+
+### Added in the SAGE+GINE milestone (2026-06-22)
+
+* **SAGEConv** — exact reach (`Y = X·W_node + A·X·W_edge + b`) in
+  [sage_reach.py](../../n2v/nn/layer_ops/sage_reach.py); forward parity 1.1e-7.
+* **GINE** — node-only reach in [gine_reach.py](../../n2v/nn/layer_ops/gine_reach.py)
+  for both variants: `hugine` (`gine_pretrain`, HuGINEConv: no message ReLU,
+  self-loops in `edge_index`, inter-layer ReLU) and `pyg` (`gine_conv`,
+  GINEConv: message ReLU + `(1+eps)·x`); forward parity 8.9e-7.
+* **Loader** — [gnn_loader.py](../../n2v/utils/gnn_loader.py) now dispatches on
+  `model_type` (gcn / sage / gine_conv / gine_pretrain) into a unified
+  `GNNModel`; `GCNModel` kept as an alias for back-compat.
+* **Wrapper** — [GraphNeuralNetwork](../../n2v/nn/graph_neural_network.py) owns
+  layers + graph structure and exposes `.evaluate` / `.reach` / `.from_mat`.
+* **Verify-spec** — [gnn_verify.py](../../n2v/utils/gnn_verify.py):
+  `verify_node_bounds` / `verify_graph_output` over the flattened output space,
+  returning verified / unknown / falsified.
+* **Tests** — +57: unit (sage/gine/wrapper/verify), sample-and-contain
+  soundness, and **cross-tool containment vs MATLAB NNV** on the IEEE-24 SAGE
+  and HuGINE checkpoints (n2v box ⊇ MATLAB box at every (instance, ε) cell).
+
+### Added: k-hop subgraph reach (2026-06-22)
+
+* **`reachSubgraph`** — per-target k-hop locality for scalable verification:
+  [GraphStar.extract_subgraph](../../n2v/sets/graph_star.py) (node slice +
+  predicate pruning), [khop helpers](../../n2v/utils/subgraph.py) (matrix for
+  GCN/SAGE, edge-list for GINE), and
+  [GraphNeuralNetwork.reach_subgraph](../../n2v/nn/graph_neural_network.py).
+  k = number of message-passing layers.
+* **Exact per target.**  On IEEE-24 and IEEE-118, the target node's reach box
+  is **bit-identical** (0.0e+00) to full-graph reach for all three layer types
+  — only boundary nodes compute unused intermediate values.
+* **Scales.**  IEEE-118 (118 nodes) yields 13-38 node subgraphs.  At ε=5e-2 on
+  GINE-IEEE-118, full-graph reach is 1.88 s (nVar≈5941) vs 0.145 s per target
+  subgraph (nVar≈543, 13 nodes) — LP size tracks subgraph, not full graph.
+* +14 tests.
+
+### Added: GINE edge-perturbation + end-to-end example (2026-06-22)
+
+* **Edge perturbation** — `gine_graph_star` / `gine_stack_reach` now accept `E`
+  as a `GraphStar` (uncertain edge features), combining node + edge predicate
+  spaces via `blkdiag` (`_build_edge_message`).  Sound for both variants
+  (0 sample violations); multi-layer is sound-but-loose (edge uncertainty
+  treated as independent per layer).  +6 tests.
+* **`examples/GNN/verify_gnn.py`** — one script for gcn / sage / gine: forward
+  parity, full-graph reach, k-hop subgraph reach (exact per target), per-target
+  robust-output spec, soundness.  Runs unchanged on IEEE-24 and IEEE-118.
+
+### Scaling note (important)
+
+Full-graph **reach** is cheap (IEEE-118 GINE ≈ 0.6 s), but full-graph
+**`get_ranges`** — one LP per output entry over the whole predicate polytope —
+does **not** scale: at IEEE-118 (nVar≈1440) it exceeds 130 s.  The scalable
+path is `reach_subgraph` + per-target `get_ranges` (≈0.03 s for 3 targets,
+13-25 node subgraphs).  `verify_gnn.py` gates full-graph bound extraction to
+graphs ≤ 30 nodes and uses per-target subgraphs above that.
+
+Full suite **1407 passed / 6 skipped / 0 failed**.
+
+### Red-team audit + soundness fix (2026-06-22)
+
+An adversarial review (independent agent + empirical fuzzing) audited every
+soundness-critical path.  Result: **one genuine soundness bug found and fixed**,
+all other paths confirmed sound.
+
+* **BUG (fixed): `GraphStar.extract_subgraph` constraint pruning.**  When a
+  pruned (dead-over-subset) predicate was coupled to a kept predicate by a
+  constraint row, the old code deleted the pruned *column* but kept the *row*,
+  which silently pinned that predicate to 0 and could shrink the target's reach
+  box **below** the true reachable set (unsound).  Reproduced end-to-end: a node
+  whose true output reached 6.0 was bounded at 5.5.  Fix: drop any constraint
+  row that references a pruned predicate (a sound relaxation); for box inputs —
+  the only case in the current pipeline — behaviour is unchanged, so real-
+  checkpoint subgraph reach stays bit-exact.  The same flaw exists in the MATLAB
+  `GraphStar.extractSubgraph.m` and should be fixed there too.  Regression tests
+  added (`test_subgraph.py`).
+* **Confirmed sound** (code reading + fuzzing, 0 violations): GINE flatten/
+  unflatten order; the predicate-space lifting in the pyg self-loop (relies on
+  `relu_star_approx` being append-only, which was verified); the edge-pert
+  `blkdiag` alignment; `add_set`'s shared-predicate assumption (only caller
+  guarantees it); k-hop completeness (symmetric BFS over-includes, never misses);
+  verify-spec sign/direction.  Degenerate cases clean: ε=0 point sets, self-loop-
+  only graphs, isolated targets, directed chains, parallel/duplicate edges.
+
+Full suite **1409 passed / 6 skipped / 0 failed**.
+
+### Expanded soundness battery (2026-06-22)
+
+Added `tests/soundness/test_soundness_gnn_fuzz.py` (+18 tests):
+
+* **Property-based fuzz** — random topology / weights / depth (1-3) / ε for all
+  four families (gcn, sage, gine-hugine, gine-pyg); reach must contain every
+  sampled forward output.
+* **Subgraph-reach soundness** — per-target box contains the target's forward
+  output (distinct from the earlier *exactness* check).
+* **Higher-ε regimes** — ε ∈ {0.05, 0.1} on real checkpoints (more crossing
+  neurons / wider relaxation).
+* **Degenerate graphs** — ε=0 point sets, self-loops-only, parallel/duplicate
+  edges, isolated targets.
+* **Verifier soundness (no false "verified")** — a reachable point that
+  violates a spec must yield "unknown", never "verified" (a false safety
+  certificate is the worst verifier bug).  Checked on synthetic + real models.
+
+Out-of-suite stress (not committed, run on demand): **850 random models**
+(600 node-perturbation across all families + 250 edge-perturbation, both
+variants, node+edge perturbed), ~34k forward samples — **0 soundness
+violations**, worst overshoot 3.4e-13 (LP/float tolerance).
+
+Full suite **1427 passed / 6 skipped / 0 failed**.
 
 ### Test totals
 - 31 GraphStar/GCN/pool unit tests in `tests/unit/`.
@@ -201,17 +311,20 @@ In rough priority order; each item is independent.
 
 ### 4.1 Layer types not yet ported
 
-* **GINE / GINEConv / HuGINE** — edge-feature aware GNNs.  Need an
-  `edge_basis` companion to `GraphStar.V` (already provisioned in the
-  GraphStar constructor) plus per-edge ReLU on the message vectors.
-  Reference: [GINEConvLayer.m](../../../gnnv2/gnnv-saiv26/nnv/code/nnv/engine/nn/layers/GINEConvLayer.m),
-  [HuGINEConvLayer.m](../../../gnnv2/gnnv-saiv26/nnv/code/nnv/engine/nn/layers/HuGINEConvLayer.m).
-  This is the largest open piece and the one Anne's SAIV26 paper hinges on.
-* **SAGEConv** — node + edge linear projections with neighborhood
-  aggregation.  Mechanically simpler than GINE; can probably be done in
-  one sitting once the edge_basis pattern is established.
-  Reference: [SAGEConvLayer.m](../../../gnnv2/gnnv-saiv26/nnv/code/nnv/engine/nn/layers/SAGEConvLayer.m).
-* **`reachSubgraph` (k-hop locality)** — needed for IEEE-118-scale graphs;
+* **SAGEConv** — ✅ done (2026-06-22), exact reach.
+* **GINE / HuGINE (node-only)** — ✅ done (2026-06-22), both variants.
+* **GINE edge-perturbation** — ✅ done (2026-06-22).  Pass `E` as a `GraphStar`
+  to `gine_graph_star` / `gine_stack_reach`; node and edge predicate spaces are
+  combined via `blkdiag(C_node, C_edge)` (`_build_edge_message` in
+  [gine_reach.py](../../n2v/nn/layer_ops/gine_reach.py)).  Sound for both
+  variants (0 sample violations).  Caveat: in a multi-layer stack each layer
+  re-combines a fresh edge-predicate copy → sound but loose (edge uncertainty
+  treated as independent across layers).  Tightening would thread one shared
+  edge-predicate identity through the stack.
+* **gine_linear** — simplest GINE variant (`mult{i}` node + `edge{i}` edge
+  projection, no MLP); loader/reach not yet wired.
+* **`reachSubgraph` (k-hop locality)** — ✅ done (2026-06-22), exact per target.
+  Original note retained for context: needed for IEEE-118-scale graphs;
   defers cost by verifying one target node at a time using only its k-hop
   neighborhood.  Reference: `GNN.reachSubgraph` in
   [GNN.m](../../../gnnv2/gnnv-saiv26/nnv/code/nnv/engine/nn/GNN.m).
