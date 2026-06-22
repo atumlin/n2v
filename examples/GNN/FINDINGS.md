@@ -141,6 +141,26 @@ violations**, worst overshoot 3.4e-13 (LP/float tolerance).
 
 Full suite **1427 passed / 6 skipped / 0 failed**.
 
+### Added: falsification / counterexample search (2026-06-22)
+
+The pipeline was sound-only (verified / unknown).  `n2v/utils/gnn_falsify.py`
+adds counterexample search so the "unknown" gap is attacked from the other
+side: `falsify_node_bounds` searches the input box for a node-feature matrix
+whose forward output escapes the spec (random multi-start + coordinate ascent
+to box vertices — the forward map is piecewise-linear, so the violation margin
+peaks at a vertex; no autograd needed).
+
+`GraphNeuralNetwork.verify(input_set, spec_lb, spec_ub, ...)` ties it together:
+reach + `verify_node_bounds` first (sound); on a non-"verified" result it runs
+the falsifier and returns **'verified' / 'falsified' (with a witness) /
+'unknown'**.  Falsification is intrinsically trustworthy — every returned
+counterexample is a real `evaluate(X)` violation (0 spurious witnesses in
+testing).  +8 tests.  Full suite **1435 passed / 6 skipped / 0 failed**.
+
+The pipeline is now import -> spec -> reach -> verify -> **falsify** -> scale.
+It remains sound-but-incomplete (no exact-star GNN reach), but "unknown" cases
+now get a counterexample search instead of a dead end.
+
 ### Test totals
 - 31 GraphStar/GCN/pool unit tests in `tests/unit/`.
 - 13 sample-and-contain soundness tests in `tests/soundness/test_soundness_gcn.py`.

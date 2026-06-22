@@ -112,6 +112,16 @@ def main() -> int:
             target_nodes=[r.target_local_idx])
         print(f"  node {r.target_node:3d}: {verdict}")
 
+    # ---- verify-or-falsify on a deliberately-too-tight spec (small graphs) --
+    if small:
+        Yc = net.evaluate(X)
+        res = net.verify(gs_in, Yc + 0.05, Yc + 100.0)   # excludes reachable center
+        msg = res.status
+        if res.status == "falsified":
+            cx = res.counterexample
+            msg += f" (counterexample found, violation margin {cx.margin:.3f})"
+        print(f"\nverify+falsify on an unsatisfiable spec: {msg}")
+
     # ---- soundness check (full-graph box on small graphs only) -------------
     if not small:
         print("\nfull-graph soundness check skipped at scale (per-target reach is exact)")

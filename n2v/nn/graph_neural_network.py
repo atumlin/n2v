@@ -21,11 +21,20 @@ from n2v.utils.gnn_loader import (
     GNNModel, GCNLayerSpec, SAGELayerSpec, GINELayerSpec, load_gnn_mat,
 )
 from n2v.utils.subgraph import khop_subgraph_matrix, khop_subgraph_edges
+from n2v.utils.gnn_falsify import falsify_node_bounds, FalsifyResult
 from n2v.nn.layer_ops.gcn_reach import (
     gcn_graph_star, gcn_evaluate, relu_graph_star,
 )
 from n2v.nn.layer_ops.sage_reach import sage_graph_star, sage_evaluate
 from n2v.nn.layer_ops.gine_reach import gine_graph_star, gine_evaluate
+
+
+@dataclass
+class VerifyResult:
+    """Verdict from :meth:`GraphNeuralNetwork.verify`."""
+    status: str                              # 'verified' | 'falsified' | 'unknown'
+    reach_set: "GraphStar" = None
+    counterexample: "FalsifyResult" = None   # populated when status == 'falsified'
 
 
 @dataclass
@@ -200,6 +209,43 @@ class GraphNeuralNetwork:
             out.extend(relu_graph_star(s, method="approx",
                                        relax_factor=relax_factor, lp_solver=lp_solver))
         return out
+
+    # ------------------------------------------------------- verify + falsify
+
+    def verify(
+        self,
+        input_set: GraphStar,
+        spec_lb: np.ndarray,
+        spec_ub: np.ndarray,
+        target_nodes: Optional[Sequence[int]] = None,
+        falsify: bool = True,
+        relax_factor: float = 0.5,
+        lp_solver: str = "default",
+        **falsify_kwargs,
+    ) -> "VerifyResult":
+        """Verify outputs stay in [spec_lb, spec_ub]; falsify the 'unknown' gap.
+
+        Runs sound reachability first.  If the reach set proves the box holds,
+        returns 'verified'.  Otherwise (when ``falsify``) searches the input box
+        for a concrete counterexample; a hit returns 'falsified' with a witness,
+        a miss returns 'unknown'.
+
+        ``input_set`` must be a box GraphStar (built via ``from_bounds``); its
+        own range supplies the input box handed to the falsifier.
+        """
+        from n2v.utils.gnn_verify import verify_node_bounds
+
+        out = self.reach(input_set, relax_factor=relax_factor, lp_solver=lp_solver)[0]
+        status = verify_node_bounds([out], spec_lb, spec_ub, target_nodes)
+        if status == "verified" or not falsify:
+            return VerifyResult(status=status, reach_set=out)
+
+        in_lb, in_ub = input_set.get_ranges()
+        res = falsify_node_bounds(self.evaluate, in_lb, in_ub, spec_lb, spec_ub,
+                                  target_nodes=target_nodes, **falsify_kwargs)
+        if res.found:
+            return VerifyResult(status="falsified", reach_set=out, counterexample=res)
+        return VerifyResult(status="unknown", reach_set=out)
 
     # --------------------------------------------------------- subgraph reach
 

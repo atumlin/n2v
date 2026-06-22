@@ -19,6 +19,7 @@ from n2v.utils.gnn_verify import (
     box_violation_halfspaces, graph_output_index,
 )
 from n2v.utils.subgraph import khop_subgraph_matrix, khop_subgraph_edges
+from n2v.utils.gnn_falsify import falsify_node_bounds, FalsifyResult
 
 __all__ = [
     "solve_lp",
@@ -41,4 +42,6 @@ __all__ = [
     "graph_output_index",
     "khop_subgraph_matrix",
     "khop_subgraph_edges",
+    "falsify_node_bounds",
+    "FalsifyResult",
 ]

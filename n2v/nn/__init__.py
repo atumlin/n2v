@@ -8,6 +8,8 @@ and provides the reach() method for reachability analysis.
 """
 
 from n2v.nn.neural_network import NeuralNetwork
-from n2v.nn.graph_neural_network import GraphNeuralNetwork, SubgraphResult
+from n2v.nn.graph_neural_network import (
+    GraphNeuralNetwork, SubgraphResult, VerifyResult,
+)
 
-__all__ = ["NeuralNetwork", "GraphNeuralNetwork", "SubgraphResult"]
+__all__ = ["NeuralNetwork", "GraphNeuralNetwork", "SubgraphResult", "VerifyResult"]
