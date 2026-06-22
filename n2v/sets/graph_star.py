@@ -276,6 +276,93 @@ class GraphStar:
         new_V[..., 0] = new_V[..., 0] + other
         return self.with_state(new_V)
 
+    def add_set(self, other: "GraphStar") -> "GraphStar":
+        """Add another GraphStar that shares this set's predicate variables.
+
+        Both operands must descend from the same input set via predicate-
+        preserving affine maps, so they have identical shape, the same number
+        of predicates, and the same constraint region (C, d, predicate bounds).
+        Their basis tensors are then summed element-wise; the shared
+        constraints are carried through unchanged.
+        """
+        if not isinstance(other, GraphStar):
+            raise TypeError(f"add_set expects GraphStar, got {type(other).__name__}")
+        if self.V.shape != other.V.shape:
+            raise ValueError(
+                f"add_set: basis shapes differ {self.V.shape} vs {other.V.shape}"
+            )
+        if self.nVar != other.nVar:
+            raise ValueError(f"add_set: nVar differs {self.nVar} vs {other.nVar}")
+        return self.with_state(self.V + other.V)
+
+    # ============================================================ Subgraph slice
+
+    def extract_subgraph(
+        self,
+        node_indices: np.ndarray,
+        sub_adjacency: Optional[np.ndarray] = None,
+    ) -> "GraphStar":
+        """Slice the GraphStar to a node subset, pruning dead predicates.
+
+        Keeps only the rows of the basis tensor for ``node_indices`` and drops
+        predicate variables whose generators are all-zero over that subset, so
+        downstream LP sizes scale with the subgraph rather than the full graph.
+        Used by k-hop subgraph verification (:meth:`GraphNeuralNetwork.reach_subgraph`).
+
+        Translated from GraphStar.extractSubgraph.m (gnnv-saiv26).
+
+        Args:
+            node_indices: 0-indexed node indices to keep (order is preserved).
+            sub_adjacency: Optional adjacency to attach to the sub-GraphStar
+                (e.g. the A_norm submatrix for GCN/SAGE).
+
+        Returns:
+            A GraphStar over the selected nodes with pruned predicates.
+        """
+        node_indices = np.asarray(node_indices, dtype=np.int64)
+        sub_V = self.V[node_indices, :, :]                 # (n_sub, F, nVar+1)
+
+        if self.nVar == 0:
+            return GraphStar(sub_V, adjacency=sub_adjacency)
+
+        gens = sub_V[:, :, 1:].reshape(-1, self.nVar)      # (n_sub*F, nVar)
+        active_idx = np.flatnonzero(np.any(gens != 0.0, axis=0))
+
+        if active_idx.size == 0:
+            # No live predicate over this subset -> point set (center only).
+            return GraphStar(sub_V[:, :, :1], adjacency=sub_adjacency)
+
+        keep_cols = np.concatenate([[0], 1 + active_idx])
+        sub_V_pruned = sub_V[:, :, keep_cols]
+
+        if self.C.size:
+            # Keep a constraint row ONLY if it touches no pruned predicate.
+            # Dropping a row that couples a kept predicate to a pruned one
+            # relaxes the predicate region (a sound over-approximation).
+            # Deleting just the pruned column while keeping the row would
+            # silently pin that predicate to 0, which can shrink the set below
+            # the true reachable set (an unsoundness).  For box inputs each row
+            # references a single predicate, so this drops exactly the pruned
+            # predicates' bound rows and is behaviourally identical.
+            pruned_mask = np.ones(self.nVar, dtype=bool)
+            pruned_mask[active_idx] = False
+            references_active = np.any(self.C[:, active_idx] != 0.0, axis=1)
+            references_pruned = np.any(self.C[:, pruned_mask] != 0.0, axis=1)
+            keep_rows = references_active & ~references_pruned
+            sub_C = self.C[np.ix_(keep_rows, active_idx)]
+            sub_d = self.d[keep_rows]
+        else:
+            sub_C, sub_d = None, None
+
+        sub_lb = self.predicate_lb[active_idx]
+        sub_ub = self.predicate_ub[active_idx]
+        return GraphStar(
+            sub_V_pruned,
+            sub_C if (sub_C is not None and sub_C.size) else None,
+            sub_d if (sub_d is not None and sub_d.size) else None,
+            sub_lb, sub_ub, adjacency=sub_adjacency,
+        )
+
     # =========================================================== Range queries
 
     def get_ranges(self, **kwargs) -> Tuple[np.ndarray, np.ndarray]:

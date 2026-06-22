@@ -11,6 +11,8 @@ rather than directly.
 from n2v.nn.layer_ops import linear_reach
 from n2v.nn.layer_ops import relu_reach
 from n2v.nn.layer_ops import gcn_reach
+from n2v.nn.layer_ops import sage_reach
+from n2v.nn.layer_ops import gine_reach
 from n2v.nn.layer_ops import graph_pool_reach
 from n2v.nn.layer_ops import flatten_reach
 from n2v.nn.layer_ops import conv2d_reach
@@ -40,6 +42,8 @@ __all__ = [
     "sigmoid_reach",
     "tanh_reach",
     "gcn_reach",
+    "sage_reach",
+    "gine_reach",
     "graph_pool_reach",
     "reach_layer",
 ]

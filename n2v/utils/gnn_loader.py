@@ -4,17 +4,22 @@ Loader for Python-trained GNN checkpoints exported as MATLAB .mat files.
 Mirrors gnnv-saiv26/nnv/code/nnv/engine/utils/gnn2nnv.m so trained models
 from the gnn_training/ pipeline can be consumed without leaving Python.
 
-Currently supports model_type == 'gcn'; SAGE / GINE / HuGINE follow once
-their layer reach ops land.
+Supported model_type values (matching gnn_training/src/export/weight_converter.py):
+    'gcn'           -> GCNLayerSpec  per layer, dense ANorm_g
+    'sage'          -> SAGELayerSpec per layer, binary A_adj
+    'gine_conv'     -> GINELayerSpec per layer (edge_linear + eps), edge structure
+    'gine_pretrain' -> GINELayerSpec per layer (edge_proj, eps=0), edge structure
 """
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 from scipy.io import loadmat
 
+
+# ============================================================ Layer specs
 
 @dataclass
 class GCNLayerSpec:
@@ -24,31 +29,55 @@ class GCNLayerSpec:
 
 
 @dataclass
+class SAGELayerSpec:
+    """One GraphSAGE layer: self + neighbor projections and a bias."""
+    W_node: np.ndarray        # (F_in, F_out) self/root weight
+    W_edge: np.ndarray        # (F_in, F_out) neighbor weight
+    b: Optional[np.ndarray]   # (F_out,) or None
+
+
+@dataclass
+class GINELayerSpec:
+    """One GINEConv layer: edge projection + 2-layer MLP + self-loop eps."""
+    W1: np.ndarray            # (F_in, hidden)  MLP layer 1
+    b1: Optional[np.ndarray]  # (hidden,)
+    W2: np.ndarray            # (hidden, F_out) MLP layer 2
+    b2: Optional[np.ndarray]  # (F_out,)
+    W_edge: np.ndarray        # (E_in, F_in)    edge projection
+    b_edge: Optional[np.ndarray]  # (F_in,)
+    eps: float = 0.0          # self-loop scaling
+
+
+@dataclass
 class NormStats:
     """Optional feature-/target-wise normalization saved alongside the model."""
     X_max: Optional[np.ndarray] = None
     Y_max: Optional[np.ndarray] = None
 
 
-@dataclass
-class GCNModel:
-    """Parsed GCN checkpoint with all data needed for evaluation and reach.
+# ============================================================ Model container
 
-    Attributes:
-        gcn_layers: List of GCNLayerSpec, one per graph-conv layer.
-        has_relu: Whether ReLU is interleaved between layers (matches MATLAB
-            gnn2nnv.m default of True).
-        A_norm: Pre-normalized adjacency matrix shared across all instances.
-        X_test, Y_test: Per-instance test inputs / targets, length = n_instances.
-            Each entry has shape (N, F_in) / (N, F_out).
-        python_predictions: Reference outputs from the original PyTorch model
-            (used as ground truth in parity tests).
-        norm_stats: Optional feature/target maxes used to denormalize outputs.
-        source_path: The .mat file the model was loaded from.
+@dataclass
+class GNNModel:
+    """Parsed GNN checkpoint with everything needed for evaluation and reach.
+
+    Fields are populated according to ``model_type``:
+        * gcn  -> ``layers`` are GCNLayerSpec, ``A_norm`` is the dense adjacency.
+        * sage -> ``layers`` are SAGELayerSpec, ``A_adj`` is the binary adjacency.
+        * gine -> ``layers`` are GINELayerSpec, ``edge_index`` / ``E`` /
+          ``edge_weights`` describe the graph.
+
+    ``gcn_layers`` and ``adjacency`` are convenience aliases so existing GCN
+    code keeps working unchanged.
     """
-    gcn_layers: List[GCNLayerSpec]
+    model_type: str
+    layers: List[Union[GCNLayerSpec, SAGELayerSpec, GINELayerSpec]]
     has_relu: bool
-    A_norm: np.ndarray
+    A_norm: Optional[np.ndarray] = None          # gcn
+    A_adj: Optional[np.ndarray] = None           # sage
+    edge_index: Optional[np.ndarray] = None      # gine (2, m) 0-indexed
+    E: Optional[np.ndarray] = None               # gine edge features (m, E_in)
+    edge_weights: Optional[np.ndarray] = None    # gine per-edge weights (m,)
     X_test: List[np.ndarray] = field(default_factory=list)
     Y_test: List[np.ndarray] = field(default_factory=list)
     python_predictions: List[np.ndarray] = field(default_factory=list)
@@ -56,22 +85,47 @@ class GCNModel:
     source_path: Optional[Path] = None
 
     @property
+    def gcn_layers(self) -> List:
+        """Back-compat alias used by the GCN reach helpers and tests."""
+        return self.layers
+
+    @property
+    def adjacency(self) -> Optional[np.ndarray]:
+        """Adjacency for matrix-based layers (gcn -> A_norm, sage -> A_adj)."""
+        return self.A_norm if self.A_norm is not None else self.A_adj
+
+    @property
+    def gine_variant(self) -> Optional[str]:
+        """GINE architecture variant: 'pyg' (gine_conv) or 'hugine' (gine_pretrain)."""
+        if self.model_type == "gine_conv":
+            return "pyg"
+        if self.model_type == "gine_pretrain":
+            return "hugine"
+        return None
+
+    @property
     def num_layers(self) -> int:
-        return len(self.gcn_layers)
+        return len(self.layers)
 
     @property
     def num_test_instances(self) -> int:
         return len(self.X_test)
 
 
+# GCNModel kept as an alias so existing imports/annotations keep working.
+GCNModel = GNNModel
+
+
+# ============================================================ scipy helpers
+
 def _decode_model_type(raw) -> str:
-    """Pull the scalar model-type string out of scipy's nested ndarray wrappers."""
+    """Pull the scalar string out of scipy's nested ndarray wrappers."""
     arr = np.asarray(raw)
     if arr.dtype.kind in ("U", "S"):
         return str(arr.flatten()[0])
     if arr.dtype == object:
         return _decode_model_type(arr.flatten()[0])
-    raise ValueError(f"Cannot decode model_type from {raw!r}")
+    raise ValueError(f"Cannot decode string from {raw!r}")
 
 
 def _unwrap_per_instance(arr) -> List[np.ndarray]:
@@ -84,35 +138,107 @@ def _unwrap_per_instance(arr) -> List[np.ndarray]:
     return out
 
 
-def _gcn_params(best_params) -> List[GCNLayerSpec]:
-    """Walk best_params.mult1, mult2, ... extracting (W, b) per layer."""
-    record = best_params[0, 0] if best_params.ndim == 2 else best_params[0]
-    field_names = list(record.dtype.names or [])
-    mult_names = sorted(
-        [n for n in field_names if n.startswith("mult")],
-        key=lambda n: int(n[4:]),
+def _record(struct):
+    """Return the scalar struct record from a scipy struct array."""
+    return struct[0, 0] if struct.ndim == 2 else struct[0]
+
+
+def _sorted_fields(record, prefix: str) -> List[str]:
+    """Field names of ``record`` starting with ``prefix``, ordered by index."""
+    names = list(record.dtype.names or [])
+    return sorted(
+        [n for n in names if n.startswith(prefix)],
+        key=lambda n: int(n[len(prefix):]),
     )
 
-    layers: List[GCNLayerSpec] = []
-    for name in mult_names:
+
+def _weights(block, name: str) -> np.ndarray:
+    block = block[0, 0] if block.ndim == 2 else block[0]
+    return np.asarray(block[name], dtype=np.float64)
+
+
+def _opt_bias(block, name: str, out_dim: int) -> Optional[np.ndarray]:
+    block = block[0, 0] if block.ndim == 2 else block[0]
+    if name not in (block.dtype.names or []):
+        return None
+    raw = np.asarray(block[name], dtype=np.float64).reshape(-1)
+    return raw if raw.size == out_dim else None
+
+
+# ============================================================ per-type parsers
+
+def _parse_gcn(best_params) -> List[GCNLayerSpec]:
+    record = _record(best_params)
+    layers = []
+    for name in _sorted_fields(record, "mult"):
         block = record[name]
-        block = block[0, 0] if block.ndim == 2 else block[0]
-        W = np.asarray(block["Weights"], dtype=np.float64)
-        bias = None
-        if "Bias" in block.dtype.names:
-            raw_b = np.asarray(block["Bias"], dtype=np.float64).reshape(-1)
-            if raw_b.size == W.shape[1]:
-                bias = raw_b
-        layers.append(GCNLayerSpec(W=W, b=bias))
+        W = _weights(block, "Weights")
+        layers.append(GCNLayerSpec(W=W, b=_opt_bias(block, "Bias", W.shape[1])))
     return layers
 
 
-def load_gnn_mat(path) -> GCNModel:
+def _parse_sage(best_params) -> List[SAGELayerSpec]:
+    record = _record(best_params)
+    layers = []
+    for name in _sorted_fields(record, "sage"):
+        block = record[name]
+        W_node = _weights(block, "NodeWeights")
+        W_edge = _weights(block, "EdgeWeights")
+        layers.append(
+            SAGELayerSpec(W_node=W_node, W_edge=W_edge,
+                          b=_opt_bias(block, "Bias", W_node.shape[1]))
+        )
+    return layers
+
+
+def _parse_gine(best_params, edge_field: str) -> List[GINELayerSpec]:
+    record = _record(best_params)
+    layers = []
+    for name in _sorted_fields(record, "conv"):
+        conv = _record(record[name])
+        W1 = _weights(conv["mlp1"], "Weights")
+        b1 = _opt_bias(conv["mlp1"], "Bias", W1.shape[1])
+        W2 = _weights(conv["mlp2"], "Weights")
+        b2 = _opt_bias(conv["mlp2"], "Bias", W2.shape[1])
+        W_edge = _weights(conv[edge_field], "Weights")
+        b_edge = _opt_bias(conv[edge_field], "Bias", W_edge.shape[1])
+        eps = 0.0
+        if "eps" in (conv.dtype.names or []):
+            eps = float(np.asarray(conv["eps"]).reshape(-1)[0])
+        layers.append(GINELayerSpec(W1, b1, W2, b2, W_edge, b_edge, eps))
+    return layers
+
+
+def _parse_test_data(raw):
+    X_test = _unwrap_per_instance(raw["X_test_g"]) if "X_test_g" in raw else []
+    Y_test = _unwrap_per_instance(raw["Y_test_g"]) if "Y_test_g" in raw else []
+    if "python_predictions" in raw:
+        pp = np.asarray(raw["python_predictions"])
+        py_pred = _unwrap_per_instance(pp) if pp.dtype == object else [np.asarray(pp, dtype=np.float64)]
+    else:
+        py_pred = []
+    norm = NormStats()
+    if "X_max" in raw:
+        norm.X_max = np.asarray(raw["X_max"], dtype=np.float64).reshape(-1)
+    if "Y_max" in raw:
+        norm.Y_max = np.asarray(raw["Y_max"], dtype=np.float64).reshape(-1)
+    return X_test, Y_test, py_pred, norm
+
+
+def _edge_index_from_mat(raw) -> np.ndarray:
+    """Build a 0-indexed (2, m) edge_index from the 1-indexed src/dst columns."""
+    src = np.asarray(raw["src"], dtype=np.int64).reshape(-1) - 1
+    dst = np.asarray(raw["dst"], dtype=np.int64).reshape(-1) - 1
+    return np.vstack([src, dst])
+
+
+# ============================================================ public loader
+
+def load_gnn_mat(path) -> GNNModel:
     """Load a GNN .mat checkpoint produced by gnn_training/mat_exporter.py.
 
-    Currently only model_type == 'gcn' is supported.  Other types raise
-    NotImplementedError pointing at the layer-op work item that must land
-    before they can be parsed.
+    Dispatches on ``model_type``; raises NotImplementedError for types whose
+    reach op has not been ported yet.
     """
     path = Path(path)
     if not path.exists():
@@ -120,45 +246,44 @@ def load_gnn_mat(path) -> GCNModel:
 
     raw = loadmat(str(path))
     model_type = _decode_model_type(raw["model_type"]).lower()
-
-    if model_type != "gcn":
-        raise NotImplementedError(
-            f"GNN model_type '{model_type}' is not yet supported. "
-            "GCN is the only loader implemented in this milestone."
-        )
-
-    A_norm = np.asarray(raw["ANorm_g"], dtype=np.float64)
-    layers = _gcn_params(raw["best_params"])
+    X_test, Y_test, py_pred, norm = _parse_test_data(raw)
 
     has_relu = True
     if "activations" in raw:
-        # MATLAB stores 'none' or 'relu'; anything not equal to 'none' keeps ReLU.
         try:
             has_relu = _decode_model_type(raw["activations"]).lower() != "none"
         except Exception:
             has_relu = True
 
-    X_test = _unwrap_per_instance(raw["X_test_g"]) if "X_test_g" in raw else []
-    Y_test = _unwrap_per_instance(raw["Y_test_g"]) if "Y_test_g" in raw else []
-    py_pred = (
-        _unwrap_per_instance(raw["python_predictions"])
-        if "python_predictions" in raw
-        else []
+    common = dict(
+        model_type=model_type, X_test=X_test, Y_test=Y_test,
+        python_predictions=py_pred, norm_stats=norm, source_path=path,
     )
 
-    norm = NormStats()
-    if "X_max" in raw:
-        norm.X_max = np.asarray(raw["X_max"], dtype=np.float64).reshape(-1)
-    if "Y_max" in raw:
-        norm.Y_max = np.asarray(raw["Y_max"], dtype=np.float64).reshape(-1)
+    if model_type == "gcn":
+        return GNNModel(
+            layers=_parse_gcn(raw["best_params"]), has_relu=has_relu,
+            A_norm=np.asarray(raw["ANorm_g"], dtype=np.float64), **common,
+        )
 
-    return GCNModel(
-        gcn_layers=layers,
-        has_relu=has_relu,
-        A_norm=A_norm,
-        X_test=X_test,
-        Y_test=Y_test,
-        python_predictions=py_pred,
-        norm_stats=norm,
-        source_path=path,
+    if model_type == "sage":
+        return GNNModel(
+            layers=_parse_sage(raw["best_params"]), has_relu=has_relu,
+            A_adj=np.asarray(raw["A_adj"], dtype=np.float64), **common,
+        )
+
+    if model_type in ("gine_conv", "gine_pretrain"):
+        edge_field = "edge_linear" if model_type == "gine_conv" else "edge_proj"
+        edge_index = _edge_index_from_mat(raw)
+        E = np.asarray(raw["E_edge"], dtype=np.float64) if "E_edge" in raw else None
+        ew = np.asarray(raw["a"], dtype=np.float64).reshape(-1) if "a" in raw else None
+        # GINE carries its own internal ReLUs; no extra inter-layer ReLU.
+        return GNNModel(
+            layers=_parse_gine(raw["best_params"], edge_field), has_relu=False,
+            edge_index=edge_index, E=E, edge_weights=ew, **common,
+        )
+
+    raise NotImplementedError(
+        f"GNN model_type '{model_type}' is not yet supported "
+        "(supported: gcn, sage, gine_conv, gine_pretrain)."
     )
