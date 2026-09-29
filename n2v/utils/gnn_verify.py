@@ -98,8 +98,8 @@ def verify_graph_output(
     if not all(isinstance(s, GraphStar) for s in reach_sets):
         raise TypeError("verify_graph_output expects a sequence of GraphStars")
 
-    code = verify_specification(list(reach_sets), property)
-    return {0: "falsified", 1: "verified", 2: "unknown"}[code]
+    result = verify_specification(list(reach_sets), property)
+    return {"SAT": "falsified", "UNSAT": "verified", "UNKNOWN": "unknown"}[result.verdict]
 
 
 def verify_node_bounds(

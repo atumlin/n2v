@@ -10,12 +10,22 @@ and converted back to ImageStar (via _preserve_imagestar_type()).
 """
 
 import logging
+import warnings
 
 import numpy as np
 from typing import List, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from n2v.sets import Star, Zono, Box, Hexatope, Octatope
+from n2v.sets import Star, Zono, Hexatope, Octatope
 from n2v.sets.image_star import ImageStar
+
+# Profiler hooks (no-op when profiling is disabled)
+from n2v.profiling import count, is_enabled
+from n2v.nn.layer_ops._profiling import (
+    record_layer_neurons,
+    record_classification,
+    record_relax_outcome,
+)
+from n2v.utils.lp_solver_enum import LPSolver
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +49,7 @@ def _preserve_imagestar_type(original: Star, new_star: Star) -> Star:
 
 def relu_star_exact(
     input_stars: List[Star],
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     verbose: bool = False,
     parallel: bool = None,
     n_workers: int = None,
@@ -58,6 +68,9 @@ def relu_star_exact(
     Returns:
         List of output Star sets (may be more than input due to splitting)
     """
+    # Profiler: static neuron count, once per layer (no-op when disabled)
+    record_layer_neurons(input_stars)
+
     # Check if we should use parallel processing
     use_parallel = _should_use_star_parallel(len(input_stars), parallel, n_workers)
 
@@ -79,7 +92,7 @@ def relu_star_exact(
 
 def _relu_single_star_exact(
     I: Star,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     verbose: bool = False,
     precomputed_bounds: tuple = None,
 ) -> List[Star]:
@@ -136,6 +149,11 @@ def _relu_single_star_exact(
     # Neurons crossing zero (lb < 0 and ub > 0) - need splitting
     split_map = np.where((lb.flatten() < 0) & (ub.flatten() > 0))[0]
 
+    # Profiler: neuron stability classification, summed across the per-star
+    # population. reset_map = always inactive (ub<=0); split_map = unstable
+    # (lb<0<ub); the remainder active. n_neurons (static) is at the layer level.
+    record_classification(I.dim, len(reset_map), len(split_map))
+
     # Recursively split each uncertain neuron
     for i, neuron_idx in enumerate(split_map):
         if verbose:
@@ -151,7 +169,7 @@ def _relu_single_star_exact(
     return current_stars
 
 
-def _step_relu(I: Star, index: int, lp_solver: str = 'default') -> List[Star]:
+def _step_relu(I: Star, index: int, lp_solver: "LPSolver | str" = LPSolver.DEFAULT) -> List[Star]:
     """
     Split a single neuron in ReLU (exact step reach).
 
@@ -170,11 +188,13 @@ def _step_relu(I: Star, index: int, lp_solver: str = 'default') -> List[Star]:
         return []
 
     if xmin >= 0:
-        # Always active
+        # Always active (the exact LP resolved an estimated-unstable neuron)
+        count("n_resolved", 1)
         return [I]
 
     elif xmax <= 0:
-        # Always inactive - zero out
+        # Always inactive - zero out (estimated-unstable resolved by exact LP)
+        count("n_resolved", 1)
         new_V = I.V.copy()
         new_V[index, :] = 0
 
@@ -191,6 +211,7 @@ def _step_relu(I: Star, index: int, lp_solver: str = 'default') -> List[Star]:
 
     else:
         # Split into two cases
+        count("n_split", 1)
         c = I.V[index, 0]
         V = I.V[index, 1:I.nVar + 1].reshape(1, -1)
 
@@ -222,7 +243,7 @@ def _step_relu(I: Star, index: int, lp_solver: str = 'default') -> List[Star]:
 def relu_star_approx(
     input_stars: List[Star],
     relax_factor: float = 0.5,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     relax_method: str = 'standard',
     precomputed_bounds: tuple = None,
 ) -> List[Star]:
@@ -243,6 +264,11 @@ def relu_star_approx(
     """
     if relax_factor == 0.0:
         return relu_star_exact(input_stars, lp_solver, precomputed_bounds=precomputed_bounds)
+
+    # Profiler: static neuron count, once per layer (no-op when disabled).
+    # (The relax_factor==0 branch above delegates to relu_star_exact, which
+    # records it; record here only for the genuinely-approximate path.)
+    record_layer_neurons(input_stars)
 
     output_stars = []
 
@@ -270,7 +296,7 @@ def relu_star_approx(
 
 def _relu_single_star_approx(
     I: Star,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     precomputed_bounds: tuple = None,
 ) -> Optional[Star]:
     """
@@ -324,6 +350,11 @@ def _relu_single_star_approx(
     # Classify neurons
     reset_map = np.where(ub_est <= 0)[0]
     crossing_map = np.where((lb_est < 0) & (ub_est > 0))[0]
+
+    # Profiler: classification + relaxation, summed across the per-star
+    # population (approx never splits). n_neurons (static) is at the layer level.
+    record_classification(I.dim, len(reset_map), len(crossing_map))
+    count("n_relaxed", len(crossing_map))
 
     # Zero out inactive neurons
     V = I.V.copy()
@@ -455,6 +486,8 @@ def relu_zono_approx(input_zonos: List[Zono]) -> List[Zono]:
     Returns:
         List of output Zonotopes (over-approximation)
     """
+    record_layer_neurons(input_zonos)  # static neuron count, once per layer
+
     output_zonos = []
 
     for zono in input_zonos:
@@ -476,6 +509,19 @@ def _relu_single_zono(I: Zono) -> Zono:
         Output Zonotope (over-approximation)
     """
     lb, ub = I.get_bounds()
+
+    # Profiler: per-zono classification + relaxation, matching the loop logic
+    # below (ub<=0 inactive; else lb>=0 active; else crossing). Guarded because
+    # these two boolean passes + reductions exist ONLY for profiling -- the
+    # per-neuron loop below recomputes classification itself and never reads
+    # them -- so the disabled path must pay nothing (cf. affine_map).
+    if is_enabled():
+        _inactive = ub.flatten() <= 0
+        _active = (~_inactive) & (lb.flatten() >= 0)
+        n_inactive = int(_inactive.sum())
+        n_unstable = I.dim - n_inactive - int(_active.sum())
+        record_classification(I.dim, n_inactive, n_unstable)
+        count("n_relaxed", n_unstable)
 
     new_c = I.c.copy()
     new_V = I.V.copy()
@@ -535,7 +581,7 @@ def relu_box(input_boxes: List) -> List:
 def _relu_single_star_relax_range(
     I: Star,
     relax_factor: float,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     precomputed_bounds: tuple = None,
 ) -> Optional[Star]:
     """
@@ -596,6 +642,9 @@ def _relu_single_star_relax_range(
     # Step 3: Find neurons crossing zero
     map2 = np.where((lb < 0) & (ub > 0))[0]
 
+    # Profiler: per-star classification (no-op when disabled)
+    record_classification(I.dim, len(map1), len(map2))
+
     if len(map2) == 0:
         return In
 
@@ -618,7 +667,7 @@ def _relu_single_star_relax_range(
     map4 = map21[map3] if len(map3) > 0 else np.array([], dtype=int)
 
     # Reset newly found inactive neurons
-    map11 = np.concatenate([map1, map4]) if len(map4) > 0 else map1
+    np.concatenate([map1, map4]) if len(map4) > 0 else map1
     In = In if len(map4) == 0 else _reset_star_rows(In, map4)
 
     # Step 6: Optimize lower bounds of neurons that are still crossing
@@ -638,6 +687,9 @@ def _relu_single_star_relax_range(
     lb3 = np.concatenate([lb1, lb2]) if len(lb2) > 0 else lb1
     ub3 = np.concatenate([ub1, ub2]) if len(ub2) > 0 else ub1
 
+    # Profiler: relaxed vs LP-resolved (no-op when disabled)
+    record_relax_outcome(len(map2), len(map9))
+
     if len(map9) == 0:
         return In
 
@@ -650,7 +702,7 @@ def _relu_single_star_relax_range(
 def _relu_single_star_relax_area(
     I: Star,
     relax_factor: float,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     precomputed_bounds: tuple = None,
 ) -> Optional[Star]:
     """
@@ -705,6 +757,9 @@ def _relu_single_star_relax_area(
     # Find neurons crossing zero
     map2 = np.where((lb < 0) & (ub > 0))[0]
 
+    # Profiler: per-star classification (no-op when disabled)
+    record_classification(I.dim, len(map1), len(map2))
+
     if len(map2) == 0:
         return In
 
@@ -725,7 +780,7 @@ def _relu_single_star_relax_area(
     map3 = np.where(xmax <= 0)[0] if len(xmax) > 0 else np.array([], dtype=int)
     map4 = map21[map3] if len(map3) > 0 else np.array([], dtype=int)
 
-    map11 = np.concatenate([map1, map4]) if len(map4) > 0 else map1
+    np.concatenate([map1, map4]) if len(map4) > 0 else map1
     In = In if len(map4) == 0 else _reset_star_rows(In, map4)
 
     map5 = np.where(xmax > 0)[0] if len(xmax) > 0 else np.array([], dtype=int)
@@ -743,6 +798,9 @@ def _relu_single_star_relax_area(
     lb3 = np.concatenate([lb1, lb2]) if len(lb2) > 0 else lb1
     ub3 = np.concatenate([ub1, ub2]) if len(ub2) > 0 else ub1
 
+    # Profiler: relaxed vs LP-resolved (no-op when disabled)
+    record_relax_outcome(len(map2), len(map9))
+
     if len(map9) == 0:
         return In
 
@@ -754,7 +812,7 @@ def _relu_single_star_relax_area(
 def _relu_single_star_relax_bound(
     I: Star,
     relax_factor: float,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     precomputed_bounds: tuple = None,
 ) -> Optional[Star]:
     """
@@ -809,6 +867,9 @@ def _relu_single_star_relax_bound(
     # Find neurons crossing zero
     map2 = np.where((lb < 0) & (ub > 0))[0]
 
+    # Profiler: per-star classification (no-op when disabled)
+    record_classification(I.dim, len(map1), len(map2))
+
     if len(map2) == 0:
         return In
 
@@ -828,19 +889,16 @@ def _relu_single_star_relax_bound(
     map21 = map2[ub_idx] if len(ub_idx) > 0 else np.array([], dtype=int)  # Optimize ub
     map22 = map2[lb_idx] if len(lb_idx) > 0 else np.array([], dtype=int)  # Optimize lb
 
-    # Optimize upper bounds
+    # Optimize upper bounds via LP for the selected neurons.
     if len(map21) > 0:
         xmax = _get_maxs(I, map21, lp_solver)
         map3 = np.where(xmax <= 0)[0]
         map4 = map21[map3] if len(map3) > 0 else np.array([], dtype=int)
-        map5 = np.where(xmax > 0)[0]
-        map6 = map21[map5] if len(map5) > 0 else np.array([], dtype=int)
-        map11 = np.concatenate([map1, map4]) if len(map4) > 0 else map1
     else:
-        map11 = map1
+        xmax = np.array([])
         map4 = np.array([], dtype=int)
-        map6 = np.array([], dtype=int)
 
+    # Neurons proven inactive by the refined upper bound: reset rows.
     In = In if len(map4) == 0 else _reset_star_rows(In, map4)
 
     # Remove newly inactive neurons from lb optimization list
@@ -849,46 +907,45 @@ def _relu_single_star_relax_bound(
     else:
         map23 = map22
 
-    # Optimize lower bounds
+    # Optimize lower bounds via LP for the selected neurons.
     if len(map23) > 0:
         xmin = _get_mins(I, map23, lp_solver)
-        map7 = np.where(xmin < 0)[0]
-        map8 = map23[map7] if len(map7) > 0 else np.array([], dtype=int)
         map9 = np.where(xmin >= 0)[0]
-        map10 = map23[map9] if len(map9) > 0 else np.array([], dtype=int)
+        proven_active = map23[map9] if len(map9) > 0 else np.array([], dtype=int)
     else:
-        map8 = np.array([], dtype=int)
-        map10 = np.array([], dtype=int)
+        xmin = np.array([])
+        proven_active = np.array([], dtype=int)
 
-    # Gather all neurons needing approximation
-    # Include neurons not selected for optimization
-    unselected = np.setdiff1d(map2, np.concatenate([map21, map22]))
-    crossing_neurons = np.concatenate([unselected, map8]) if len(map8) > 0 else unselected
+    # Issue #15 fix: EVERY neuron that still crosses zero must receive
+    # triangle constraints. The previous logic constrained only
+    # ``unselected + (lb-optimized still-negative)`` -- ub-optimized
+    # neurons whose refined max stayed positive were left with
+    # unconstrained identity rows, so the output star excluded true
+    # outputs by O(1) (line-star repro in issue #15: the output was the
+    # unchanged input star).
+    #
+    # Still-crossing = map2
+    #   minus proven-inactive (map4: refined ub <= 0, rows reset above)
+    #   minus proven-active  (refined lb >= 0, identity rows are exact).
+    refined_ub = {int(i): float(v) for i, v in zip(map21, xmax)}
+    refined_lb = {int(i): float(v) for i, v in zip(map23, xmin)}
+
+    n_drop = len(map4) + len(proven_active)
+    drop = (np.concatenate([map4, proven_active])
+            if n_drop > 0 else np.array([], dtype=int))
+    crossing_neurons = np.setdiff1d(map2, drop)
+
+    # Profiler: relaxed vs LP-resolved (no-op when disabled)
+    record_relax_outcome(len(map2), len(crossing_neurons))
 
     if len(crossing_neurons) == 0:
         return In
 
-    # Get bounds for all crossing neurons
-    lbs = []
-    ubs = []
-    for idx in crossing_neurons:
-        if idx in map8:
-            # Optimized bound
-            opt_idx = np.where(map8 == idx)[0][0]
-            lbs.append(xmin[np.where(map23 == idx)[0][0]])
-            # Need to get ub - check if it was optimized
-            if idx in map6:
-                ub_opt_idx = np.where(map6 == idx)[0][0]
-                ubs.append(xmax[np.where(map21 == idx)[0][0]])
-            else:
-                ubs.append(ub[idx])
-        else:
-            # Not optimized, use estimated
-            lbs.append(lb[idx])
-            ubs.append(ub[idx])
-
-    lb_arr = np.array(lbs)
-    ub_arr = np.array(ubs)
+    # Best-available bounds: LP-refined where computed, estimated otherwise.
+    lb_arr = np.array(
+        [refined_lb.get(int(i), lb[i]) for i in crossing_neurons])
+    ub_arr = np.array(
+        [refined_ub.get(int(i), ub[i]) for i in crossing_neurons])
 
     result = _apply_triangle_approx_multi(In, crossing_neurons, lb_arr, ub_arr)
 
@@ -981,7 +1038,7 @@ def _apply_triangle_approx_multi(
     return Star(new_V, new_C, new_d, new_pred_lb, new_pred_ub, outer_zono=None)
 
 
-def _get_maxs(star: Star, indices: np.ndarray, lp_solver: str = 'default') -> np.ndarray:
+def _get_maxs(star: Star, indices: np.ndarray, lp_solver: "LPSolver | str" = LPSolver.DEFAULT) -> np.ndarray:
     """
     Get maximum values for multiple state dimensions.
 
@@ -1005,7 +1062,7 @@ def _get_maxs(star: Star, indices: np.ndarray, lp_solver: str = 'default') -> np
     return xmax
 
 
-def _get_mins(star: Star, indices: np.ndarray, lp_solver: str = 'default') -> np.ndarray:
+def _get_mins(star: Star, indices: np.ndarray, lp_solver: "LPSolver | str" = LPSolver.DEFAULT) -> np.ndarray:
     """
     Get minimum values for multiple state dimensions.
 
@@ -1090,7 +1147,7 @@ def _get_star_workers(n_stars: int, n_workers: int = None) -> int:
 
 def _relu_star_exact_parallel(
     input_stars: List[Star],
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     verbose: bool = False,
     n_workers: int = None,
     precomputed_bounds: tuple = None,
@@ -1125,6 +1182,18 @@ def _relu_star_exact_parallel(
         return output_stars
 
     # Parallel processing
+    # Profiler caveat: worker PROCESSES can't share the parent's region tree, so
+    # their counts (n_split/n_lp_solves/classification) are lost — totals read
+    # low here. Warn once so the numbers aren't silently CPU-count-dependent.
+    # (See plan §9 "process-pool record-return".) Run n_workers=1 for accuracy.
+    if is_enabled():
+        warnings.warn(
+            "Profiler: exact-ReLU ProcessPool path active; per-worker counters "
+            "are not captured (totals will read low). Use n_workers=1 for "
+            "accurate profiling.",
+            RuntimeWarning, stacklevel=2,
+        )
+
     # Convert ImageStars to Stars first (conversion is fast, not worth parallelizing)
     stars_2d = [s.to_star() if isinstance(s, ImageStar) else s for s in input_stars]
     output_stars = []
@@ -1192,6 +1261,9 @@ def _relu_single_hexatope(I: Hexatope, solver: str = None) -> List[Hexatope]:
     # Step 2: Split crossing neurons
     crossing = np.where((lb.flatten() < 0) & (ub.flatten() > 0))[0]
 
+    # Profiler: per-set neuron classification (no-op when disabled)
+    record_classification(n, len(inactive), len(crossing))
+
     if len(crossing) == 0:
         return [I]
 
@@ -1217,6 +1289,8 @@ def _relu_single_hexatope(I: Hexatope, solver: str = None) -> List[Hexatope]:
 
             new_sets.append(active)
             new_sets.append(inactive_set)
+        # n_split = branches added this neuron: P sets each double (P->2P).
+        count("n_split", len(current_sets))
         current_sets = new_sets
 
     return current_sets
@@ -1233,6 +1307,7 @@ def relu_hexatope(input_hexatopes: List[Hexatope], solver: str = None) -> List[H
         input_hexatopes: List of input Hexatope sets
         solver: Optional solver method ('lp' or 'mcf').
     """
+    record_layer_neurons(input_hexatopes)  # static neuron count, once per layer
     output_hexatopes = []
     for hexatope in input_hexatopes:
         output_hexatopes.extend(_relu_single_hexatope(hexatope, solver=solver))
@@ -1280,6 +1355,9 @@ def _relu_single_octatope(I: Octatope, solver: str = None) -> List[Octatope]:
 
     crossing = np.where((lb.flatten() < 0) & (ub.flatten() > 0))[0]
 
+    # Profiler: per-set neuron classification (no-op when disabled)
+    record_classification(n, len(inactive), len(crossing))
+
     if len(crossing) == 0:
         return [I]
 
@@ -1303,6 +1381,8 @@ def _relu_single_octatope(I: Octatope, solver: str = None) -> List[Octatope]:
 
             new_sets.append(active)
             new_sets.append(inactive_set)
+        # n_split = branches added this neuron: P sets each double (P->2P).
+        count("n_split", len(current_sets))
         current_sets = new_sets
 
     return current_sets
@@ -1316,6 +1396,7 @@ def relu_octatope(input_octatopes: List[Octatope], solver: str = None) -> List[O
         input_octatopes: List of input Octatope sets
         solver: Optional solver method ('lp' or 'mcf').
     """
+    record_layer_neurons(input_octatopes)  # static neuron count, once per layer
     output_octatopes = []
     for octatope in input_octatopes:
         output_octatopes.extend(_relu_single_octatope(octatope, solver=solver))

@@ -14,7 +14,7 @@ These bounds are passed to Star reachability to skip LP calls for stable neurons
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Dict, List, Tuple, Union, Optional, Any
+from typing import Dict, Tuple, Union, Optional, Any
 
 from n2v.sets import Star, Zono, Box
 from n2v.sets.image_star import ImageStar
@@ -54,7 +54,10 @@ def compute_intermediate_bounds(
 # IBP (Interval Bound Propagation) — fast, works for any model
 # ============================================================================
 
-def _compute_bounds_ibp(model: nn.Module, input_set: Union[Star, Zono, Box, ImageStar, ImageZono]) -> Dict[Union[int, str], Tuple[np.ndarray, np.ndarray]]:
+def _compute_bounds_ibp(
+    model: nn.Module,
+    input_set: Union[Star, Zono, Box, ImageStar, ImageZono],
+) -> Dict[Union[int, str], Tuple[np.ndarray, np.ndarray]]:
     """
     Compute bounds via Interval Bound Propagation.
 
@@ -76,14 +79,59 @@ def _compute_bounds_ibp(model: nn.Module, input_set: Union[Star, Zono, Box, Imag
         return _ibp_sequential(model, lb, ub, spatial_shape)
 
 
+def _hwc_flat_to_chw_flat(v: np.ndarray, height: int, width: int,
+                          channels: int) -> np.ndarray:
+    """Reorder a spatial vector from the ImageStar/ImageZono HWC ravel to the
+    NCHW (channel-major) ravel the IBP forward pass assumes.
+
+    ImageStar/ImageZono store their data (H, W, C) and ``estimate_ranges`` /
+    ``get_bounds`` ravel it in that HWC order. The IBP conv/pool/batchnorm
+    helpers, however, ``reshape`` their flat input to ``(C, H, W)`` (torch's
+    NCHW layout). Feeding an HWC-flat vector into a ``(C, H, W)`` reshape
+    silently scrambles the image (channels read as rows), so multi-channel
+    CNNs produce wrong — and unsound — precomputed bounds. Reorder up front."""
+    return v.reshape(height, width, channels).transpose(2, 0, 1).reshape(-1)
+
+
+def _record_spatial_bounds(lb: np.ndarray, ub: np.ndarray,
+                           shape: Optional[tuple]) -> Tuple[np.ndarray, np.ndarray]:
+    """Package (lb, ub) for a nonlinear layer so their row order matches the
+    Star the reach consumer builds.
+
+    The IBP pass carries NCHW (channel-major) flat vectors. A spatial ReLU in
+    the reach path runs on an ImageStar, which ``to_star()`` flattens in HWC
+    order; the precomputed bounds are matched positionally against those rows,
+    so a spatial (rank-3 ``(C, H, W)``) layer's bounds must be reordered
+    CHW->HWC. Flat layers (``shape is None``, e.g. after a flatten/Linear)
+    already agree and are passed through unchanged."""
+    if shape is not None and len(shape) == 3:
+        c, h, w = shape
+        lb = lb.reshape(c, h, w).transpose(1, 2, 0).reshape(-1)
+        ub = ub.reshape(c, h, w).transpose(1, 2, 0).reshape(-1)
+    return lb.reshape(-1, 1), ub.reshape(-1, 1)
+
+
 def _extract_bounds(input_set: Union[Star, Zono, Box, ImageStar, ImageZono]) -> Tuple[np.ndarray, np.ndarray]:
-    """Extract (lb, ub) numpy arrays from any input set type."""
+    """Extract (lb, ub) numpy arrays from any input set type, in the NCHW
+    (channel-major) order the IBP forward pass reshapes to. Spatial sets store
+    HWC, so their ranges are reordered to CHW here (see
+    :func:`_hwc_flat_to_chw_flat`)."""
     if isinstance(input_set, Box):
         return input_set.lb.flatten(), input_set.ub.flatten()
-    elif isinstance(input_set, (Star, ImageStar)):
+    elif isinstance(input_set, ImageStar):
+        lb, ub = input_set.estimate_ranges()
+        h, w, c = input_set.height, input_set.width, input_set.num_channels
+        return (_hwc_flat_to_chw_flat(lb.flatten(), h, w, c),
+                _hwc_flat_to_chw_flat(ub.flatten(), h, w, c))
+    elif isinstance(input_set, Star):
         lb, ub = input_set.estimate_ranges()
         return lb.flatten(), ub.flatten()
-    elif isinstance(input_set, (Zono, ImageZono)):
+    elif isinstance(input_set, ImageZono):
+        lb, ub = input_set.get_bounds()
+        h, w, c = input_set.height, input_set.width, input_set.num_channels
+        return (_hwc_flat_to_chw_flat(lb.flatten(), h, w, c),
+                _hwc_flat_to_chw_flat(ub.flatten(), h, w, c))
+    elif isinstance(input_set, Zono):
         lb, ub = input_set.get_bounds()
         return lb.flatten(), ub.flatten()
     else:
@@ -102,7 +150,12 @@ def _ibp_linear(lb: np.ndarray, ub: np.ndarray, weight: np.ndarray, bias: Option
     return new_lb, new_ub
 
 
-def _ibp_conv(lb: np.ndarray, ub: np.ndarray, layer: Union[nn.Conv2d, nn.Conv1d], input_shape: tuple) -> Tuple[np.ndarray, np.ndarray, tuple]:
+def _ibp_conv(
+    lb: np.ndarray,
+    ub: np.ndarray,
+    layer: Union[nn.Conv2d, nn.Conv1d],
+    input_shape: tuple,
+) -> Tuple[np.ndarray, np.ndarray, tuple]:
     """IBP through Conv2d/Conv1d using PyTorch (handles padding, stride, dilation)."""
     # Reshape to NCHW/NCW
     lb_t = torch.tensor(lb.reshape(input_shape), dtype=torch.float64).unsqueeze(0)
@@ -156,7 +209,12 @@ def _ibp_tanh(lb: np.ndarray, ub: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return np.tanh(lb), np.tanh(ub)
 
 
-def _ibp_pool(lb: np.ndarray, ub: np.ndarray, layer: Union[nn.MaxPool2d, nn.AvgPool2d], spatial_shape: tuple) -> Tuple[np.ndarray, np.ndarray, tuple]:
+def _ibp_pool(
+    lb: np.ndarray,
+    ub: np.ndarray,
+    layer: Union[nn.MaxPool2d, nn.AvgPool2d],
+    spatial_shape: tuple,
+) -> Tuple[np.ndarray, np.ndarray, tuple]:
     """IBP through MaxPool2d/AvgPool2d."""
     lb_t = torch.tensor(lb.reshape(spatial_shape), dtype=torch.float64).unsqueeze(0)
     ub_t = torch.tensor(ub.reshape(spatial_shape), dtype=torch.float64).unsqueeze(0)
@@ -181,7 +239,12 @@ def _ibp_pool(lb: np.ndarray, ub: np.ndarray, layer: Union[nn.MaxPool2d, nn.AvgP
     return new_lb.numpy().flatten(), new_ub.numpy().flatten(), new_lb.shape
 
 
-def _ibp_batchnorm(lb: np.ndarray, ub: np.ndarray, layer: Union[nn.BatchNorm1d, nn.BatchNorm2d], spatial_shape: tuple) -> Tuple[np.ndarray, np.ndarray, tuple]:
+def _ibp_batchnorm(
+    lb: np.ndarray,
+    ub: np.ndarray,
+    layer: Union[nn.BatchNorm1d, nn.BatchNorm2d],
+    spatial_shape: tuple,
+) -> Tuple[np.ndarray, np.ndarray, tuple]:
     """IBP through BatchNorm (affine: y = gamma * (x - mean) / std + beta)."""
     # BN in eval mode is just an affine transform per channel
     mean = layer.running_mean.detach().double().numpy()
@@ -210,7 +273,12 @@ def _ibp_batchnorm(lb: np.ndarray, ub: np.ndarray, layer: Union[nn.BatchNorm1d, 
     return new_lb.flatten(), new_ub.flatten(), new_lb.shape
 
 
-def _ibp_sequential(model: nn.Module, lb: np.ndarray, ub: np.ndarray, spatial_shape: Optional[tuple] = None) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+def _ibp_sequential(
+    model: nn.Module,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    spatial_shape: Optional[tuple] = None,
+) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
     """IBP for Sequential models."""
     layer_bounds = {}
 
@@ -219,9 +287,10 @@ def _ibp_sequential(model: nn.Module, lb: np.ndarray, ub: np.ndarray, spatial_sh
         layers = [model]
 
     for i, layer in enumerate(layers):
-        # Record bounds BEFORE nonlinear layers
+        # Record bounds BEFORE nonlinear layers (reordered CHW->HWC for a
+        # spatial layer so they line up with the reach set's row order).
         if isinstance(layer, NONLINEAR_TYPES):
-            layer_bounds[i] = (lb.reshape(-1, 1), ub.reshape(-1, 1))
+            layer_bounds[i] = _record_spatial_bounds(lb, ub, spatial_shape)
 
         # Propagate
         lb, ub, spatial_shape = _ibp_propagate_layer(layer, lb, ub, spatial_shape)
@@ -229,17 +298,119 @@ def _ibp_sequential(model: nn.Module, lb: np.ndarray, ub: np.ndarray, spatial_sh
     return layer_bounds
 
 
-def _ibp_graphmodule(graph_module: Any, lb: np.ndarray, ub: np.ndarray, spatial_shape: Optional[tuple] = None) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
-    """IBP for GraphModule (ONNX-converted) models."""
+def _get_param_np(graph_module: Any, node: Any) -> np.ndarray:
+    """Extract a parameter tensor (get_attr or OnnxConstant) as a numpy array."""
+    if getattr(node, 'op', None) == 'call_module':
+        module = dict(graph_module.named_modules()).get(node.target)
+        if module is not None and hasattr(module, 'value'):
+            return module.value.detach().cpu().numpy()
+    obj = graph_module
+    for attr in node.target.split('.'):
+        obj = getattr(obj, attr)
+    return obj.detach().cpu().numpy()
+
+
+def _ibp_onnx_matmul(graph_module, node, node_bounds):
+    """IBP through OnnxMatMul ``y = x @ W`` (W a frozen parameter)."""
+    if len(node.args) != 2:
+        return None
+    a, w = node.args
+    if not (hasattr(a, 'name') and a.name in node_bounds):
+        return None
+    if getattr(w, 'op', None) != 'get_attr':
+        return None
+    W = _get_param_np(graph_module, w)
+    la, ua, _ = node_bounds[a.name]
+    la_flat = la.flatten()
+    # Soundness/robustness guard: only the plain flat ``x @ W`` form (W a 2-D matrix whose
+    # contraction dim matches the flattened activation) is handled here. For any other shape
+    # (multi-dim left operand, weight-on-the-left, conv-flattened/batched matmul) return None
+    # so the caller falls back to the untrusted/LP path -- mirrors ``_ibp_onnx_binary``. IBP is
+    # only a precompute speedup, so skipping it stays sound and avoids a hard ValueError crash
+    # on these matmuls (see status repo CRASH_ROOTCAUSE.md, Bug A).
+    if W.ndim != 2 or la_flat.shape[0] != W.shape[0]:
+        return None
+    new_lb, new_ub = _ibp_linear(la_flat, ua.flatten(), W.T, None)
+    return new_lb, new_ub, None
+
+
+def _ibp_onnx_binary(graph_module, node, module, node_bounds):
+    """IBP through OnnxBinaryMathOperation (Add/Sub/Mul/Div).
+
+    Handles both the residual case (two computed branches) and the
+    constant case (second operand a frozen parameter). Returns None when
+    the operation cannot be soundly propagated (e.g. a per-channel
+    constant that does not broadcast onto a flattened image), so the
+    caller marks the result untrusted and falls back to LP.
+    """
+    if len(node.args) != 2 or not hasattr(module, 'math_op_function'):
+        return None
+    a, b = node.args
+    op = module.math_op_function.__name__
+    a_known = hasattr(a, 'name') and a.name in node_bounds
+    b_known = hasattr(b, 'name') and b.name in node_bounds
+
+    if a_known and b_known:  # residual: both operands are computed sets
+        la, ua, sa = node_bounds[a.name]
+        lb2, ub2, _ = node_bounds[b.name]
+        la, ua, lb2, ub2 = (x.flatten() for x in (la, ua, lb2, ub2))
+        if la.shape != lb2.shape:
+            return None
+        if 'add' in op:
+            return la + lb2, ua + ub2, sa
+        if 'sub' in op:
+            return la - ub2, ua - lb2, sa
+        if op == 'mul':
+            p = np.stack([la * lb2, la * ub2, ua * lb2, ua * ub2])
+            return p.min(0), p.max(0), sa
+        return None
+
+    if not a_known or getattr(b, 'op', None) != 'get_attr':
+        return None
+    param = _get_param_np(graph_module, b).flatten()
+    la, ua, sa = node_bounds[a.name]
+    la, ua = la.flatten(), ua.flatten()
+    if param.size not in (1, la.size):
+        return None  # non-broadcastable (e.g. per-channel on flat image)
+    if op == 'mul':
+        p = np.stack([la * param, ua * param])
+        return p.min(0), p.max(0), sa
+    if op == '_onnx_div':
+        inv = 1.0 / param
+        p = np.stack([la * inv, ua * inv])
+        return p.min(0), p.max(0), sa
+    if 'add' in op:
+        return la + param, ua + param, sa
+    if 'sub' in op:
+        return la - param, ua - param, sa
+    return None
+
+
+def _ibp_graphmodule(
+    graph_module: Any,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    spatial_shape: Optional[tuple] = None,
+) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """IBP for GraphModule (ONNX-converted) models.
+
+    Tracks, per node, whether its bounds are *trusted* (every op on the
+    path was soundly propagated). Bounds are recorded for a nonlinear
+    layer only when its input is trusted — so an unhandled op makes the
+    pre-pass skip downstream layers (reach falls back to LP for them)
+    rather than attach stale / wrong-dimension bounds.
+    """
     import operator
 
     named_modules = dict(graph_module.named_modules())
-    node_bounds = {}  # node_name -> (lb, ub, spatial_shape)
+    node_bounds = {}    # node_name -> (lb, ub, spatial_shape)
+    node_trusted = {}   # node_name -> bool
     layer_bounds = {}
 
     for node in graph_module.graph.nodes:
         if node.op == 'placeholder':
             node_bounds[node.name] = (lb, ub, spatial_shape)
+            node_trusted[node.name] = True
 
         elif node.op == 'get_attr':
             pass
@@ -249,30 +420,53 @@ def _ibp_graphmodule(graph_module: Any, lb: np.ndarray, ub: np.ndarray, spatial_
             if module is None:
                 continue
 
-            # Get input bounds
-            cur_lb, cur_ub, cur_shape = lb, ub, spatial_shape
-            if node.args and hasattr(node.args[0], 'name') and node.args[0].name in node_bounds:
-                cur_lb, cur_ub, cur_shape = node_bounds[node.args[0].name]
+            in_name = (node.args[0].name
+                       if node.args and hasattr(node.args[0], 'name')
+                       else None)
+            cur_lb, cur_ub, cur_shape = node_bounds.get(
+                in_name, (lb, ub, spatial_shape))
+            cur_trusted = node_trusted.get(in_name, True)
 
-            # Record bounds before nonlinear layers
-            if isinstance(module, NONLINEAR_TYPES):
-                layer_bounds[node.name] = (cur_lb.reshape(-1, 1), cur_ub.reshape(-1, 1))
+            # Record bounds before nonlinear layers (only if trusted),
+            # reordered CHW->HWC for a spatial layer so they line up with the
+            # reach set's row order (ImageStar.to_star() is HWC).
+            if isinstance(module, NONLINEAR_TYPES) and cur_trusted:
+                layer_bounds[node.name] = _record_spatial_bounds(
+                    cur_lb.reshape(-1), cur_ub.reshape(-1), cur_shape)
 
-            # Propagate
+            # Propagate. Try ONNX graph ops first, then standard layers.
+            module_type = type(module).__name__
+            result = None
             try:
-                new_lb, new_ub, new_shape = _ibp_propagate_layer(module, cur_lb, cur_ub, cur_shape)
+                if module_type == 'OnnxMatMul':
+                    result = _ibp_onnx_matmul(graph_module, node, node_bounds)
+                elif module_type == 'OnnxBinaryMathOperation':
+                    result = _ibp_onnx_binary(
+                        graph_module, node, module, node_bounds)
+            except Exception:  # noqa: BLE001 - IBP precompute is an optimization; never crash reach
+                result = None
+
+            if result is not None:
+                new_lb, new_ub, new_shape = result
                 node_bounds[node.name] = (new_lb, new_ub, new_shape)
-                lb, ub, spatial_shape = new_lb, new_ub, new_shape
-            except (NotImplementedError, Exception):
-                # For unsupported layers, pass through with infinite bounds
-                node_bounds[node.name] = (cur_lb, cur_ub, cur_shape)
-                lb, ub, spatial_shape = cur_lb, cur_ub, cur_shape
+                node_trusted[node.name] = cur_trusted
+            else:
+                try:
+                    new_lb, new_ub, new_shape = _ibp_propagate_layer(
+                        module, cur_lb, cur_ub, cur_shape)
+                    node_bounds[node.name] = (new_lb, new_ub, new_shape)
+                    node_trusted[node.name] = cur_trusted
+                except Exception:  # noqa: BLE001 - unknown op: stop trusting
+                    node_bounds[node.name] = (cur_lb, cur_ub, cur_shape)
+                    node_trusted[node.name] = False
 
         elif node.op == 'call_function':
             if node.target is operator.getitem:
                 src_node = node.args[0]
                 if hasattr(src_node, 'name') and src_node.name in node_bounds:
                     node_bounds[node.name] = node_bounds[src_node.name]
+                    node_trusted[node.name] = node_trusted.get(
+                        src_node.name, False)
 
         elif node.op == 'output':
             pass
@@ -280,7 +474,12 @@ def _ibp_graphmodule(graph_module: Any, lb: np.ndarray, ub: np.ndarray, spatial_
     return layer_bounds
 
 
-def _ibp_propagate_layer(layer: nn.Module, lb: np.ndarray, ub: np.ndarray, spatial_shape: Optional[tuple]) -> Tuple[np.ndarray, np.ndarray, Optional[tuple]]:
+def _ibp_propagate_layer(
+    layer: nn.Module,
+    lb: np.ndarray,
+    ub: np.ndarray,
+    spatial_shape: Optional[tuple],
+) -> Tuple[np.ndarray, np.ndarray, Optional[tuple]]:
     """Propagate IBP bounds through a single layer. Returns (lb, ub, spatial_shape)."""
 
     if isinstance(layer, nn.Linear):
@@ -365,10 +564,12 @@ def _ibp_propagate_layer(layer: nn.Module, lb: np.ndarray, ub: np.ndarray, spati
 # Zonotope pre-pass — tighter bounds, expensive for large inputs
 # ============================================================================
 
-def _compute_bounds_zono(model: nn.Module, input_set: Union[Star, Zono, Box, ImageStar, ImageZono]) -> Dict[Union[int, str], Tuple[np.ndarray, np.ndarray]]:
+def _compute_bounds_zono(
+    model: nn.Module,
+    input_set: Union[Star, Zono, Box, ImageStar, ImageZono],
+) -> Dict[Union[int, str], Tuple[np.ndarray, np.ndarray]]:
     """Compute bounds using Zonotope propagation."""
     import torch.fx as fx
-    from n2v.nn.layer_ops.dispatcher import reach_layer
 
     zono_set = _convert_to_zono(input_set)
 
@@ -427,6 +628,7 @@ def _zono_graphmodule(graph_module: Any, zono_set: Union[Zono, ImageZono]) -> Di
     from n2v.nn.layer_ops.dispatcher import reach_layer
     from n2v.nn.reach import (
         _handle_reshape,
+        _reshape_feeds_spatial,
         _handle_onnx_concat,
         _handle_onnx_slice,
         _handle_onnx_split,
@@ -468,13 +670,16 @@ def _zono_graphmodule(graph_module: Any, zono_set: Union[Zono, ImageZono]) -> Di
                 shape_node = node.args[1]
                 shape_tensor = _get_parameter(graph_module, shape_node)
                 target_shape = tuple(shape_tensor.numpy().astype(int))
-                result_sets = _handle_reshape(input_sets_op, target_shape)
+                force_flat = not _reshape_feeds_spatial(node, graph_module)
+                result_sets = _handle_reshape(
+                    input_sets_op, target_shape, force_flat=force_flat)
                 node_values[node.name] = result_sets
                 current_sets = result_sets
                 continue
 
             if isinstance(module, OnnxConcat):
-                result_sets = _handle_onnx_concat(module, node, node_values)
+                result_sets = _handle_onnx_concat(
+                    module, node, node_values, graph_module)
                 if result_sets is not None:
                     node_values[node.name] = result_sets
                     current_sets = result_sets

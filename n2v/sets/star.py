@@ -9,9 +9,8 @@ Translated from MATLAB NNV Star.m
 """
 
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional, Tuple, TYPE_CHECKING
+from typing import List, Optional, Tuple, Union, TYPE_CHECKING
 
-import cvxpy as cp
 import numpy as np
 from scipy.linalg import block_diag
 
@@ -25,8 +24,12 @@ if TYPE_CHECKING:
 
 # Import utility modules
 from n2v.utils.lpsolver import solve_lp, check_feasibility, solve_lp_batch
+from n2v.utils.lp_solver_enum import LPSolver, resolve as _resolve_lp
 
 from n2v.config import config as global_config
+
+# Profiler hooks (no-op when profiling is disabled)
+from n2v.profiling import region, count, is_enabled, OPERATION
 
 
 class Star:
@@ -48,6 +51,12 @@ class Star:
         state_lb: Lower bounds of state variables
         state_ub: Upper bounds of state variables
         Z: Outer zonotope covering this star (optional)
+        relax_meta: Per-neuron triangle-relaxation metadata (optional; set by the
+            refinement reach, ``None`` otherwise). Pure data, no geometric effect.
+        fixed: Refinement-search provenance -- the fixed neuron phases that
+            produced this star (set by ``n2v.refine``; ``None`` otherwise).
+        bound_mode: Refinement-search provenance -- the bound mode the reach used
+            ("box"|"lp_cpu"|"lp_gpu"; set by ``n2v.refine``; ``None`` otherwise).
     """
 
     def __init__(
@@ -60,6 +69,7 @@ class Star:
         state_lb: Optional[np.ndarray] = None,
         state_ub: Optional[np.ndarray] = None,
         outer_zono: Optional['Zono'] = None,
+        relax_meta: Optional[list] = None,
     ):
         """
         Initialize a Star set.
@@ -73,6 +83,12 @@ class Star:
             state_lb: State variable lower bounds
             state_ub: State variable upper bounds
             outer_zono: Outer zonotope approximation
+            relax_meta: Optional per-neuron relaxation metadata describing this
+                star's own triangle-relaxed predicate variables (a list of
+                ``n2v.refine.types.NeuronMeta``). Set by the refinement reach so
+                the refine set-operations (split/tighten) are self-describing;
+                ``None`` for ordinary geometric stars. Pure data — it never
+                affects the geometry or any geometric operation.
         """
         if V is None:
             # Empty constructor
@@ -86,6 +102,10 @@ class Star:
             self.state_lb = None
             self.state_ub = None
             self.Z = None
+            self.relax_meta = None
+            self.fixed = None
+            self.bound_mode = None
+            self.checkpoints = None
             return
 
         # Convert to numpy arrays
@@ -155,6 +175,13 @@ class Star:
         # Outer zonotope
         self.Z = outer_zono
 
+        # Optional refinement metadata + search provenance (see Args). Pure data,
+        # no geometric effect; always present (None unless set by n2v.refine).
+        self.relax_meta = relax_meta
+        self.fixed = None
+        self.bound_mode = None
+        self.checkpoints = None
+
     def __repr__(self) -> str:
         """Return string representation of the Star set."""
         return f"Star(dim={self.dim}, nVar={self.nVar}, nConstraints={self.C.shape[0]})"
@@ -194,7 +221,12 @@ class Star:
             raise ValueError(f"Matrix W has {W.shape[1]} columns, expected {self.dim}")
 
         # Transform V: new_V = W * V
-        new_V = W @ self.V
+        with region("affine_map", OPERATION):
+            new_V = W @ self.V
+            # FLOPs of the (m,n)@(n,p+1) matmul: 2 mul-adds per output element.
+            # Guarded (like the conv sites) so the disabled path pays nothing.
+            if is_enabled():
+                count("flops", 2 * W.shape[0] * W.shape[1] * self.V.shape[1])
 
         # Add bias to center if provided
         if b is not None:
@@ -319,7 +351,7 @@ class Star:
 
     # ======================== Bounds Computation ========================
 
-    def get_box(self, lp_solver: str = 'default') -> 'Box':
+    def get_box(self, lp_solver: Union[LPSolver, str, None] = LPSolver.DEFAULT) -> 'Box':
         """
         Compute exact bounding box using LP.
 
@@ -330,10 +362,11 @@ class Star:
             Box object
         """
         from .box import Box
-        lb, ub = self.get_ranges(lp_solver=lp_solver)
+        solver = _resolve_lp(lp_solver)
+        lb, ub = self.get_ranges(lp_solver=solver)
         return Box(lb, ub)
 
-    def get_range(self, index: int, lp_solver: str = 'default') -> Tuple[float, float]:
+    def get_range(self, index: int, lp_solver: Union[LPSolver, str, None] = LPSolver.DEFAULT) -> Tuple[float, float]:
         """
         Compute exact range at specific dimension using LP.
 
@@ -350,9 +383,10 @@ class Star:
         if self.nVar == 0:
             return self.V[index, 0], self.V[index, 0]
 
+        solver = _resolve_lp(lp_solver)
         f = self.V[index, 1:].flatten()
         results = self._solve_lp_batch(
-            [f, f], [True, False], lp_solver,
+            [f, f], [True, False], solver,
         )
 
         xmin_val, xmax_val = results[0], results[1]
@@ -361,7 +395,7 @@ class Star:
 
         return xmin_val + self.V[index, 0], xmax_val + self.V[index, 0]
 
-    def get_min(self, index: int, lp_solver: str = 'default') -> Optional[float]:
+    def get_min(self, index: int, lp_solver: Union[LPSolver, str, None] = LPSolver.DEFAULT) -> Optional[float]:
         """
         Compute exact minimum at specific dimension using LP.
 
@@ -378,10 +412,11 @@ class Star:
         if index < 0 or index >= self.dim:
             raise ValueError(f"Invalid index {index}, dimension is {self.dim}")
 
+        solver = _resolve_lp(lp_solver)
         # Define LP: min f^T * alpha subject to C * alpha <= d
         f = self.V[index, 1:].reshape(-1, 1)
 
-        xmin = self._solve_lp(f, minimize=True, lp_solver=lp_solver)
+        xmin = self._solve_lp(f, minimize=True, lp_solver=solver)
 
         if xmin is None:
             return None
@@ -389,7 +424,7 @@ class Star:
         # Add constant term
         return xmin + self.V[index, 0]
 
-    def get_max(self, index: int, lp_solver: str = 'default') -> Optional[float]:
+    def get_max(self, index: int, lp_solver: Union[LPSolver, str, None] = LPSolver.DEFAULT) -> Optional[float]:
         """
         Compute exact maximum at specific dimension using LP.
 
@@ -406,10 +441,11 @@ class Star:
         if index < 0 or index >= self.dim:
             raise ValueError(f"Invalid index {index}, dimension is {self.dim}")
 
+        solver = _resolve_lp(lp_solver)
         # Define LP: max f^T * alpha subject to C * alpha <= d
         f = self.V[index, 1:].reshape(-1, 1)
 
-        xmax = self._solve_lp(f, minimize=False, lp_solver=lp_solver)
+        xmax = self._solve_lp(f, minimize=False, lp_solver=solver)
 
         if xmax is None:
             return None
@@ -417,7 +453,7 @@ class Star:
         # Add constant term
         return xmax + self.V[index, 0]
 
-    def get_ranges(self, lp_solver: str = 'default', parallel: bool = None,
+    def get_ranges(self, lp_solver: Union[LPSolver, str, None] = LPSolver.DEFAULT, parallel: bool = None,
                    n_workers: int = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute exact ranges for all dimensions.
@@ -444,6 +480,7 @@ class Star:
             >>> # Force sequential
             >>> lb, ub = star.get_ranges(parallel=False)
         """
+        solver = _resolve_lp(lp_solver)
         # Determine if we should use parallel
         if parallel is None:
             use_parallel = global_config.should_use_parallel(self.dim)
@@ -455,12 +492,12 @@ class Star:
             n_workers = global_config.get_n_workers(self.dim)
 
         if use_parallel:
-            return self._get_ranges_parallel(lp_solver, n_workers)
+            return self._get_ranges_parallel(solver, n_workers)
 
         # Batch path: single solve_lp_batch call for all dimensions
-        return self._get_ranges_batch(lp_solver)
+        return self._get_ranges_batch(solver)
 
-    def _get_ranges_parallel(self, lp_solver: str = 'default',
+    def _get_ranges_parallel(self, lp_solver: Union[LPSolver, str, None] = LPSolver.DEFAULT,
                             n_workers: int = 4) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute ranges for all dimensions in parallel using ThreadPoolExecutor.
@@ -479,7 +516,7 @@ class Star:
             """Compute range for dimension i."""
             try:
                 return i, self.get_range(i, lp_solver)
-            except Exception as e:
+            except Exception:
                 # If LP fails, return None to indicate failure
                 return i, (None, None)
 
@@ -502,7 +539,7 @@ class Star:
         return lb, ub
 
     def _get_ranges_batch(
-        self, lp_solver: str = 'default',
+        self, lp_solver: Union[LPSolver, str, None] = LPSolver.DEFAULT,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute ranges for all dimensions using a single batched LP call.
@@ -619,7 +656,7 @@ class Star:
         self,
         objectives: List[np.ndarray],
         minimize_flags: List[bool],
-        lp_solver: str = 'default',
+        lp_solver: Union[LPSolver, str, None] = LPSolver.DEFAULT,
     ) -> List[Optional[float]]:
         """
         Batch solve LPs sharing this star's constraints.
@@ -648,7 +685,8 @@ class Star:
         )
 
     def _solve_lp(
-        self, f: np.ndarray, minimize: bool = True, lp_solver: str = 'default'
+        self, f: np.ndarray, minimize: bool = True,
+        lp_solver: Union[LPSolver, str, None] = LPSolver.DEFAULT,
     ) -> Optional[float]:
         """
         Solve LP: min/max f^T * alpha subject to C * alpha <= d and bounds.
@@ -687,62 +725,212 @@ class Star:
         else:
             return None
 
-    def is_empty_set(self, lp_solver: str = 'default') -> bool:
+    def is_empty_set(self, lp_solver: Union[LPSolver, str, None] = LPSolver.DEFAULT) -> bool:
         """
         Check if Star is empty (constraints are infeasible).
 
         Returns:
             True if empty, False otherwise
         """
+        solver = _resolve_lp(lp_solver)
+
+        # Point Star (no predicate variables): the set is the single point
+        # V[:, 0]. Any constraints have an empty coefficient matrix, so each
+        # row reduces to the constant ``0 <= d_i``. The set is empty iff some
+        # row demands ``0 <= d_i`` with ``d_i < 0``. This case can't go through
+        # check_feasibility: a zero-column C means a zero-variable LP, whose
+        # dimension the solver derives from C.shape[1] and so cannot form.
+        if self.nVar == 0:
+            d = np.asarray(self.d).flatten()
+            if d.size > 0:
+                return bool(np.any(d < -1e-9))
+            return False
+
         # Use centralized feasibility checker
         A = self.C if self.C.size > 0 else None
         b = self.d if self.C.size > 0 else None
         lb = self.predicate_lb if self.predicate_lb is not None else None
         ub = self.predicate_ub if self.predicate_ub is not None else None
 
-        return not check_feasibility(A=A, b=b, lb=lb, ub=ub, lp_solver=lp_solver)
+        return not check_feasibility(A=A, b=b, lb=lb, ub=ub, lp_solver=solver)
 
-    def contains(self, x: np.ndarray, lp_solver: str = 'default') -> bool:
+    def contains(
+        self,
+        X: np.ndarray,
+        method: str = 'lp',
+        lp_solver: Union[LPSolver, str, None] = LPSolver.DEFAULT,
+        _eps: float = 1e-9,
+    ):
         """
-        Check if point x is in the Star.
+        Check point containment in the Star.
 
         Args:
-            x: Point to check (dim,) or (dim, 1)
+            X: Shape (dim,) or (dim, 1) for a single point (returns bool).
+               Shape (N, dim) for a batch (returns (N,) bool ndarray).
+            method: 'lp' (authoritative, one feasibility LP per point) or
+                    'algebraic' (fast vectorized path, valid only when
+                    V[:, 1:] has full column rank).
+            lp_solver: Passed through to n2v.utils.lpsolver.check_feasibility.
+            _eps: Tolerance for inequality/residual checks in the algebraic
+                  path.
 
         Returns:
-            True if x is in the Star
+            bool for single-point input, (N,) bool ndarray for batch input.
+
+        Raises:
+            ValueError: On wrong-shape input, or when method='algebraic' is
+                requested but V[:, 1:] does not have full column rank.
         """
-        x = np.asarray(x).reshape(-1, 1)
+        lp_solver = _resolve_lp(lp_solver)
+        X = np.asarray(X, dtype=np.float64)
 
-        if x.shape[0] != self.dim:
-            raise ValueError(f"Point dimension {x.shape[0]} doesn't match Star dim {self.dim}")
-
-        # Solve: find alpha such that V * [1; alpha] = x and C * alpha <= d
-        # This is: V[:, 0] + V[:, 1:] * alpha = x
-        # So: V[:, 1:] * alpha = x - V[:, 0]
-
-        # This is a feasibility problem
-        alpha = cp.Variable(self.nVar)
-
-        constraints = [self.V[:, 1:] @ alpha == (x - self.V[:, 0:1]).flatten()]
-
-        if self.C.size > 0:
-            constraints.append(self.C @ alpha <= self.d.flatten())
-        if self.predicate_lb is not None:
-            constraints.append(alpha >= self.predicate_lb.flatten())
-        if self.predicate_ub is not None:
-            constraints.append(alpha <= self.predicate_ub.flatten())
-
-        prob = cp.Problem(cp.Minimize(0), constraints)
-        try:
-            if lp_solver == 'default':
-                prob.solve()
+        # Dispatch on shape: (dim,) or (dim, 1) -> single; (N, dim) -> batch.
+        single_point = False
+        if X.ndim == 1:
+            # (dim,) single point
+            if X.shape[0] != self.dim:
+                raise ValueError(
+                    f"Point dimension {X.shape[0]} doesn't match Star dim {self.dim}"
+                )
+            X_batch = X.reshape(1, self.dim)
+            single_point = True
+        elif X.ndim == 2:
+            if X.shape == (self.dim, 1):
+                # Column-vector single point
+                X_batch = X.reshape(1, self.dim)
+                single_point = True
+            elif X.shape[1] == self.dim:
+                # (N, dim) batch
+                X_batch = X
             else:
-                prob.solve(solver=lp_solver)
+                raise ValueError(
+                    f"Input shape {X.shape} not compatible with Star dim {self.dim}. "
+                    f"Expected (dim,), (dim, 1), or (N, dim)."
+                )
+        else:
+            raise ValueError(
+                f"Input must be 1D or 2D, got {X.ndim}D with shape {X.shape}"
+            )
 
-            return prob.status in ['optimal', 'optimal_inaccurate']
-        except:
-            return False
+        if method == 'lp':
+            result = self._contains_lp(X_batch, lp_solver=lp_solver)
+        elif method == 'algebraic':
+            result = self._contains_algebraic(X_batch, _eps=_eps)
+        else:
+            raise ValueError(
+                f"Unknown method {method!r}; expected 'lp' or 'algebraic'."
+            )
+
+        if single_point:
+            return bool(result[0])
+        return result
+
+    def _contains_lp(
+        self, X_batch: np.ndarray, lp_solver: str = 'default'
+    ) -> np.ndarray:
+        """
+        LP-based containment check for a batch of points.
+
+        For each point y, solve a feasibility LP:
+            find alpha s.t. V[:, 1:] @ alpha = y - V[:, 0]
+                            C @ alpha <= d
+                            plb <= alpha <= pub
+        """
+        N = X_batch.shape[0]
+        Aeq = self.V[:, 1:]
+        center = self.V[:, 0]
+
+        A = self.C if self.C.size > 0 else None
+        b = self.d.flatten() if self.C.size > 0 else None
+        lb = self.predicate_lb.flatten() if self.predicate_lb is not None else None
+        ub = self.predicate_ub.flatten() if self.predicate_ub is not None else None
+
+        result = np.zeros(N, dtype=bool)
+        for i in range(N):
+            beq = X_batch[i] - center
+            try:
+                result[i] = check_feasibility(
+                    A=A, b=b, Aeq=Aeq, beq=beq, lb=lb, ub=ub, lp_solver=lp_solver
+                )
+            except Exception:
+                result[i] = False
+        return result
+
+    def _contains_algebraic(
+        self, X_batch: np.ndarray, _eps: float = 1e-9
+    ) -> np.ndarray:
+        """
+        Fast algebraic containment check. Valid only when V[:, 1:] has full
+        column rank (nVar <= dim and rank == nVar). Raises ValueError
+        otherwise.
+        """
+        basis = self.V[:, 1:]  # (dim, nVar)
+        center = self.V[:, 0]  # (dim,)
+        dim, nVar = basis.shape
+
+        if nVar > dim:
+            raise ValueError(
+                "Algebraic containment requires V[:, 1:] to have full column "
+                f"rank, but basis shape ({dim}, {nVar}) has more columns than "
+                "rows (wide basis)."
+            )
+
+        N = X_batch.shape[0]
+        # RHS for each point: (dim, N)
+        rhs = (X_batch - center).T
+
+        if nVar == dim:
+            # Square full-rank case: direct solve.
+            # Check rank first to guarantee invertibility.
+            rank = np.linalg.matrix_rank(basis)
+            if rank != nVar:
+                raise ValueError(
+                    f"Algebraic containment requires V[:, 1:] to have full "
+                    f"column rank, but rank={rank} < nVar={nVar}."
+                )
+            alpha = np.linalg.solve(basis, rhs).T  # (N, nVar)
+            residual_ok = np.ones(N, dtype=bool)
+        else:
+            # Tall case (nVar < dim): least squares + residual check.
+            alpha_ls, _, rank, _ = np.linalg.lstsq(basis, rhs, rcond=None)
+            if rank != nVar:
+                raise ValueError(
+                    f"Algebraic containment requires V[:, 1:] to have full "
+                    f"column rank, but rank={rank} < nVar={nVar}."
+                )
+            alpha = alpha_ls.T  # (N, nVar)
+            # Verify the candidate alpha actually reconstructs the point.
+            reconstructed = (basis @ alpha_ls).T  # (N, dim)
+            target = X_batch - center  # (N, dim)
+            residual_ok = np.all(
+                np.abs(reconstructed - target) <= _eps, axis=1
+            )
+
+        # Check predicate bounds (elementwise, with eps tolerance to match
+        # the LP solver's numerical slack).
+        if self.predicate_lb is not None:
+            plb = self.predicate_lb.flatten()
+            lb_ok = np.all(alpha >= plb - _eps, axis=1)
+        else:
+            lb_ok = np.ones(N, dtype=bool)
+
+        if self.predicate_ub is not None:
+            pub = self.predicate_ub.flatten()
+            ub_ok = np.all(alpha <= pub + _eps, axis=1)
+        else:
+            ub_ok = np.ones(N, dtype=bool)
+
+        # Check C @ alpha <= d.
+        if self.C is not None and self.C.size > 0:
+            C = self.C
+            d = self.d.flatten()
+            # (nConstr, N) = C @ alpha.T
+            lhs = C @ alpha.T
+            cd_ok = np.all(lhs <= d[:, None] + _eps, axis=0)
+        else:
+            cd_ok = np.ones(N, dtype=bool)
+
+        return residual_ok & lb_ok & ub_ok & cd_ok
 
     # ======================== Conversion Methods ========================
 

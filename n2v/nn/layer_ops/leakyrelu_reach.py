@@ -19,6 +19,14 @@ import numpy as np
 from typing import List, Optional
 from n2v.sets import Star, Zono
 from n2v.sets.image_star import ImageStar
+from n2v.utils.lp_solver_enum import LPSolver
+
+# Profiler hooks (no-op when profiling is disabled)
+from n2v.profiling import count
+from n2v.nn.layer_ops._profiling import (
+    record_layer_neurons,
+    record_classification,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +41,7 @@ def _preserve_imagestar_type(original: Star, new_star: Star) -> Star:
 def leakyrelu_star_exact(
     input_stars: List[Star],
     gamma: float = 0.01,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     verbose: bool = False,
     precomputed_bounds: tuple = None,
 ) -> List[Star]:
@@ -50,6 +58,9 @@ def leakyrelu_star_exact(
     Returns:
         List of output Star sets (may be more than input due to splitting)
     """
+    # Profiler: static neuron count, once per layer (no-op when disabled)
+    record_layer_neurons(input_stars)
+
     output_stars = []
     for star in input_stars:
         star_2d = star.to_star() if isinstance(star, ImageStar) else star
@@ -62,7 +73,7 @@ def leakyrelu_star_exact(
 def _leakyrelu_single_star_exact(
     I: Star,
     gamma: float,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     verbose: bool = False,
     precomputed_bounds: tuple = None,
 ) -> List[Star]:
@@ -99,6 +110,10 @@ def _leakyrelu_single_star_exact(
     # Split on neurons crossing zero
     split_map = np.where((lb.flatten() < 0) & (ub.flatten() > 0))[0]
 
+    # Profiler: classification, summed across the per-star population (inactive =
+    # always-negative-slope; unstable = crossing). n_neurons at the layer level.
+    record_classification(I.dim, len(inactive_map), len(split_map))
+
     for i, neuron_idx in enumerate(split_map):
         if verbose:
             logger.debug(f'Exact LeakyReLU_{neuron_idx} ({i+1}/{len(split_map)})')
@@ -111,7 +126,7 @@ def _leakyrelu_single_star_exact(
     return current_stars
 
 
-def _step_leakyrelu(I: Star, index: int, gamma: float, lp_solver: str = 'default') -> List[Star]:
+def _step_leakyrelu(I: Star, index: int, gamma: float, lp_solver: "LPSolver | str" = LPSolver.DEFAULT) -> List[Star]:
     """Split a single neuron for LeakyReLU (exact step reach)."""
     xmin, xmax = I.get_range(index, lp_solver)
 
@@ -119,10 +134,12 @@ def _step_leakyrelu(I: Star, index: int, gamma: float, lp_solver: str = 'default
         return []
 
     if xmin >= 0:
+        count("n_resolved", 1)
         return [I]
 
     elif xmax <= 0:
         # Always inactive — scale by gamma
+        count("n_resolved", 1)
         new_V = I.V.copy()
         new_V[index, :] = gamma * new_V[index, :]
 
@@ -139,6 +156,7 @@ def _step_leakyrelu(I: Star, index: int, gamma: float, lp_solver: str = 'default
 
     else:
         # Split into two cases
+        count("n_split", 1)
         c = I.V[index, 0]
         V_row = I.V[index, 1:I.nVar + 1].reshape(1, -1)
 
@@ -170,7 +188,7 @@ def _step_leakyrelu(I: Star, index: int, gamma: float, lp_solver: str = 'default
 def leakyrelu_star_approx(
     input_stars: List[Star],
     gamma: float = 0.01,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     precomputed_bounds: tuple = None,
 ) -> List[Star]:
     """
@@ -190,6 +208,9 @@ def leakyrelu_star_approx(
     Returns:
         List of output Stars (no splitting, same count as input)
     """
+    # Profiler: static neuron count, once per layer (no-op when disabled)
+    record_layer_neurons(input_stars)
+
     output_stars = []
     for star in input_stars:
         star_2d = star.to_star() if isinstance(star, ImageStar) else star
@@ -203,7 +224,7 @@ def leakyrelu_star_approx(
 def _leakyrelu_single_star_approx(
     I: Star,
     gamma: float,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     precomputed_bounds: tuple = None,
 ) -> Optional[Star]:
     """Approximate LeakyReLU for a single Star."""
@@ -389,31 +410,35 @@ def _leakyrelu_single_zono(I: Zono, gamma: float) -> Zono:
             pass
 
         else:
-            # Crosses zero — over-approximation
-            # Secant slope: a = (ub - gamma*lb) / (ub - lb)
-            a = (ui - gamma * li) / (ui - li) if (ui - li) != 0 else 1.0
+            # Crosses zero — over-approximate with the exact envelope
+            # band (issue #16). The secant through (li, gamma*li) and
+            # (ui, ui) has slope ``a`` and intercept ``b_u``; since
+            # LeakyReLU is piecewise linear with its kink at 0, the
+            # residual f(x) - a*x on [li, ui] attains its extremes at
+            # the kink (value 0) and at the endpoints (value b_u):
+            #
+            #     f(x) - a*x  in  [min(0, b_u), max(0, b_u)]
+            #
+            # Centre the affine part mid-band and add ONE error
+            # generator of radius |b_u| / 2 (the DeepZ form; the band is
+            # the tightest parallel envelope). Handles gamma > 1 too,
+            # where b_u < 0 and the band flips sides.
+            #
+            # The previous code's ``shift`` was algebraically equal to
+            # b_u (the affine part WAS the upper secant) and both of its
+            # ``error`` formulas evaluated to exactly zero, so no
+            # generator was ever added: the output collapsed to the
+            # secant line and excluded true outputs for correlated
+            # inputs (issue #16 repro: f(0,0) = (0,0) excluded by 0.99).
+            a = (ui - gamma * li) / (ui - li)
+            b_u = gamma * li - a * li
 
-            # y ≈ a*x + shift, where shift centers the approximation
-            # Upper bound at lb: a*lb + shift_u = gamma*lb → shift_u = (gamma - a)*lb
-            # Upper bound at ub: a*ub + shift_u vs ub → may exceed
-            # Use midpoint of upper and lower intercepts
-            y_at_lb = gamma * li
-            y_at_ub = ui
-            midpoint = 0.5 * (y_at_lb + y_at_ub)
-            linear_at_mid = a * 0.5 * (li + ui)
-            shift = midpoint - linear_at_mid
-
-            new_c[i] = a * I.c[i, 0] + shift
+            new_c[i] = a * I.c[i, 0] + 0.5 * b_u
             new_V[i, :n_orig] = a * I.V[i, :]
 
-            # Error generator: half the gap between upper and lower envelopes
-            error = 0.5 * abs(ui - gamma * li) - 0.5 * abs(a * (ui - li))
-            if error < 0:
-                error = 0.5 * max(abs(y_at_ub - (a * ui + shift)),
-                                  abs(y_at_lb - (a * li + shift)))
-            if error > 1e-10:
-                error_gen = np.zeros((I.dim, 1))
-                error_gen[i] = error
+            if b_u != 0.0:
+                error_gen = np.zeros((new_V.shape[0], 1))
+                error_gen[i] = 0.5 * abs(b_u)
                 new_V = np.hstack([new_V, error_gen])
 
     return Zono(new_c, new_V)

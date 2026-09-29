@@ -12,11 +12,13 @@ import numpy as np
 from typing import List
 from n2v.sets import Star, Zono
 from n2v.sets.image_star import ImageStar
+from n2v.utils.lp_solver_enum import LPSolver
 from n2v.nn.layer_ops.sigmoid_reach import (
     _s_curve_single_star_approx,
     _s_curve_single_zono,
     _preserve_imagestar_type,
 )
+from n2v.nn.layer_ops._profiling import record_layer_neurons
 
 
 def _tanh(x: np.ndarray) -> np.ndarray:
@@ -31,7 +33,7 @@ def _tanh_deriv(x: np.ndarray) -> np.ndarray:
 
 def tanh_star_approx(
     input_stars: List[Star],
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
 ) -> List[Star]:
     """
     Approximate Tanh reachability for Star sets.
@@ -46,6 +48,9 @@ def tanh_star_approx(
     Returns:
         List of output Stars
     """
+    # Profiler: static neuron count, once per layer (no-op when disabled)
+    record_layer_neurons(input_stars)
+
     output_stars = []
     for star in input_stars:
         star_2d = star.to_star() if isinstance(star, ImageStar) else star

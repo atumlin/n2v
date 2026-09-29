@@ -12,8 +12,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 from n2v.sets import Star, ImageStar, ImageZono, Hexatope, Octatope
+from n2v.utils.lp_solver_enum import LPSolver
+
+# Profiler hooks (no-op when profiling is disabled)
+from n2v.profiling import count, is_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +26,7 @@ def maxpool2d_star(
     layer: nn.MaxPool2d,
     input_stars: List[Star],
     method: str = 'exact',
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     verbose: bool = False,
     **kwargs
 ) -> List[Star]:
@@ -43,15 +47,22 @@ def maxpool2d_star(
         List of output Stars (ImageStars)
     """
     if method == 'exact':
-        return _maxpool2d_star_exact_multiple(layer, input_stars, lp_solver, verbose)
+        out = _maxpool2d_star_exact_multiple(layer, input_stars, lp_solver, verbose)
     else:
-        return _maxpool2d_star_approx_multiple(layer, input_stars, lp_solver, verbose)
+        out = _maxpool2d_star_approx_multiple(layer, input_stars, lp_solver, verbose)
+
+    # Profiler: static output pooling-window count (== output elements), once
+    # per layer -- the MaxPool analog of n_neurons (no-op when disabled).
+    if is_enabled() and out:
+        o = out[0]
+        count("n_pool_windows", o.height * o.width * o.num_channels)
+    return out
 
 
 def _maxpool2d_star_exact_single(
     layer: nn.MaxPool2d,
     input_star: ImageStar,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     verbose: bool = False
 ) -> List[ImageStar]:
     """
@@ -79,7 +90,7 @@ def _maxpool2d_star_exact_single(
     # V is 4D: (H, W, C, nVar+1)
     V = pad_star.V
     h_in, w_in, c_in, n_cols = V.shape
-    n_pred = n_cols - 1
+    n_cols - 1
 
     # Get kernel size and stride (can be int, tuple, or list from onnx2torch)
     kernel_size = layer.kernel_size
@@ -134,6 +145,11 @@ def _maxpool2d_star_exact_single(
                     # Multiple possible maxes - need to split
                     split_positions.append((i, j, k))
 
+    # Profiler: pooling-window classification, summed across the per-star
+    # population (no-op when disabled). uncertain = windows whose argmax is
+    # ambiguous over the input bounds and therefore need splitting.
+    count("n_uncertain", len(split_positions))
+
     # Create initial output star with 4D V
     output_stars = [ImageStar(
         V_out, pad_star.C, pad_star.d,
@@ -156,6 +172,8 @@ def _maxpool2d_star_exact_single(
             split_stars = _step_split_4d(
                 star, pad_star, (i, j, k), max_idx_list, lp_solver
             )
+            # n_split = branch operations = population growth (no-op when off)
+            count("n_split", len(split_stars) - 1)
             new_stars.extend(split_stars)
 
         if verbose:
@@ -169,7 +187,7 @@ def _maxpool2d_star_exact_single(
 def _maxpool2d_star_exact_multiple(
     layer: nn.MaxPool2d,
     input_stars: List[ImageStar],
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     verbose: bool = False
 ) -> List[ImageStar]:
     """
@@ -187,7 +205,7 @@ def _maxpool2d_star_exact_multiple(
 def _maxpool2d_star_approx_single(
     layer: nn.MaxPool2d,
     input_star: ImageStar,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     verbose: bool = False
 ) -> ImageStar:
     """
@@ -255,6 +273,12 @@ def _maxpool2d_star_approx_single(
                 max_indices[(i, j, k)] = max_idx
                 if len(max_idx) > 1:
                     new_pred_count += 1
+
+    # Profiler: classification + relaxation, summed across the per-star
+    # population (approx never splits; no-op when disabled). Each uncertain
+    # window introduces one new predicate variable instead of branching.
+    count("n_uncertain", new_pred_count)
+    count("n_relaxed", new_pred_count)
 
     if verbose and new_pred_count > 0:
         logger.debug(f'{new_pred_count} new variables are introduced')
@@ -331,7 +355,7 @@ def _maxpool2d_star_approx_single(
 def _maxpool2d_star_approx_multiple(
     layer: nn.MaxPool2d,
     input_stars: List[ImageStar],
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
     verbose: bool = False
 ) -> List[ImageStar]:
     """
@@ -476,13 +500,19 @@ def _get_local_max_index_4d(
     max_lb_val = max(lbs)
     max_lb_idx = lbs.index(max_lb_val)
 
-    # Check which points could potentially be >= max_lb_val
-    candidates = [i for i, ub in enumerate(ubs) if ub >= max_lb_val]
+    # A pixel introduces genuine uncertainty about the window max only if it
+    # can STRICTLY exceed the best guaranteed value (max_lb_val): the max is
+    # provably at least max_lb_val (achieved by max_lb_idx), so any pixel with
+    # ub <= max_lb_val can never be the strict maximizer. Using >= here would
+    # flag every all-equal window (e.g. the many all-zero windows after ReLU)
+    # as uncertain, spawning a degenerate over-approx predicate per window —
+    # the dominant cost behind ImageNet-scale MaxPool OOM (issue #50).
+    contenders = [i for i, ub in enumerate(ubs) if ub > max_lb_val]
 
-    if len(candidates) == 1:
+    if not contenders:
+        # Output equals max_lb_val exactly — deterministic, no predicate.
         return [points[max_lb_idx]]
-    else:
-        return [points[i] for i in candidates]
+    return [points[i] for i in sorted(set(contenders) | {max_lb_idx})]
 
 
 def _get_local_bounds_4d(
@@ -506,7 +536,7 @@ def _step_split_4d(
     original_star: ImageStar,
     pos: Tuple[int, int, int],
     max_indices: List[Tuple[int, int]],
-    lp_solver: str
+    lp_solver: "LPSolver | str"
 ) -> List[ImageStar]:
     """
     Split an ImageStar into multiple stars based on which pixel is max.

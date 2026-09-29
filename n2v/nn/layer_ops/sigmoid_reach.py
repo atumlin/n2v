@@ -14,11 +14,15 @@ activation functions (Sigmoid, Tanh) parameterized by:
   - df0: derivative at inflection point (x=0)
 """
 
-import warnings
 import numpy as np
 from typing import List, Optional, Callable
 from n2v.sets import Star, Zono
 from n2v.sets.image_star import ImageStar
+from n2v.utils.lp_solver_enum import LPSolver
+
+# Profiler hooks (no-op when profiling is disabled)
+from n2v.profiling import count
+from n2v.nn.layer_ops._profiling import record_layer_neurons
 
 
 def _preserve_imagestar_type(original: Star, new_star: Star) -> Star:
@@ -46,7 +50,7 @@ def _sigmoid_deriv(x: np.ndarray) -> np.ndarray:
 
 def sigmoid_star_approx(
     input_stars: List[Star],
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
 ) -> List[Star]:
     """
     Approximate Sigmoid reachability for Star sets.
@@ -60,6 +64,9 @@ def sigmoid_star_approx(
     Returns:
         List of output Stars (no splitting)
     """
+    # Profiler: static neuron count, once per layer (no-op when disabled)
+    record_layer_neurons(input_stars)
+
     output_stars = []
     for star in input_stars:
         star_2d = star.to_star() if isinstance(star, ImageStar) else star
@@ -105,7 +112,7 @@ def _s_curve_single_star_approx(
     func_deriv: Callable,
     f0: float,
     df0: float,
-    lp_solver: str = 'default',
+    lp_solver: "LPSolver | str" = LPSolver.DEFAULT,
 ) -> Optional[Star]:
     """
     Approximate reachability for an S-shaped activation using NNV's
@@ -152,10 +159,19 @@ def _s_curve_single_star_approx(
     constant_map = np.where(np.abs(ubs - lbs) < 1e-10)[0]
     varying_map = np.where(np.abs(ubs - lbs) >= 1e-10)[0]
 
+    # Profiler: smooth activations relax every varying neuron (no split),
+    # summed across the per-star population. n_neurons (static layer size) is
+    # recorded once at the layer level.
+    count("n_constant", len(constant_map))
+    count("n_relaxed", len(varying_map))
+
     if len(varying_map) == 0:
-        # All constant — just apply function
+        # All constant — apply the function to the constant VALUE
+        # (lbs == ubs), not the center column: a star can carry its
+        # value in constrained predicate variables (e.g. the z vars of
+        # a McCormick product) with a zero center column.
         new_V = np.zeros_like(I.V)
-        new_V[:, 0] = func(I.V[:, 0])
+        new_V[:, 0] = func(lbs)
         return Star(new_V, I.C, I.d, I.predicate_lb, I.predicate_ub)
 
     # Evaluate function and derivative at bounds
@@ -193,7 +209,7 @@ def _s_curve_single_star_approx(
     # Case classification
     convex_mask = l >= 0       # Case 1
     concave_mask = u <= 0      # Case 2
-    mixed_mask = (l < 0) & (u > 0)  # Case 3
+    (l < 0) & (u > 0)  # Case 3
 
     # Secant slope for all
     secant_slope = (fu - fl) / (u - l)

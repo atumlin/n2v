@@ -13,7 +13,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import List
-from n2v.sets import Star, Zono, Box, ImageStar, ImageZono, Hexatope, Octatope
+from n2v.sets import Star, Zono, ImageStar, ImageZono, Hexatope, Octatope
+
+# Profiler hook (no-op when profiling is disabled)
+from n2v.profiling import region, count, OPERATION, is_enabled
 
 
 def conv2d_star(
@@ -44,7 +47,20 @@ def conv2d_star(
     for star in input_stars:
         if isinstance(star, ImageStar):
             # Optimized 4D path for ImageStar
-            output_star = _conv2d_imagestar_4d(layer, star)
+            with region("conv2d", OPERATION):
+                output_star = _conv2d_imagestar_4d(layer, star)
+                # FLOPs: 2 mul-adds per (output element x kernel x in_channels),
+                # applied to every basis column (center + generators).
+                if is_enabled():
+                    kh, kw = (layer.kernel_size if isinstance(layer.kernel_size, tuple)
+                              else (layer.kernel_size, layer.kernel_size))
+                    out_elems = (output_star.height * output_star.width
+                                 * output_star.num_channels)
+                    n_cols = output_star.V.shape[-1]
+                    # each output channel connects to in_channels/groups inputs
+                    count("flops",
+                          2 * out_elems * n_cols * kh * kw
+                          * (layer.in_channels // layer.groups))
         elif isinstance(star, Star):
             # TODO: Add conv2d support for Star by constructing conv matrix
             # For now, require ImageStar
@@ -267,7 +283,6 @@ def conv2d_box(layer: nn.Conv2d, input_boxes: List) -> List:
     Returns:
         List of output Boxes
     """
-    from n2v.sets import Box
 
     output_boxes = []
 
@@ -313,8 +328,8 @@ def conv2d_hexatope(layer: nn.Conv2d, input_hexatopes: List[Hexatope]) -> List[H
         # This is a simplification - in practice, image dimensions should be known
 
         # Use interval over-approximation: apply conv to bounds
-        lb_reshaped = lb.reshape(-1, 1)
-        ub_reshaped = ub.reshape(-1, 1)
+        lb.reshape(-1, 1)
+        ub.reshape(-1, 1)
 
         # Convert bounds to ImageStar temporarily to apply convolution
         # This is an over-approximation
