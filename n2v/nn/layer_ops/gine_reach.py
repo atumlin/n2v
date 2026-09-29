@@ -69,7 +69,11 @@ def _relu_on_basis(V, C, d, pred_lb, pred_ub, relax_factor, lp_solver):
     flat = V.reshape(rows * cols, K)
     star = Star(flat, C if (C is not None and C.size) else None,
                 d if (d is not None and d.size) else None, pred_lb, pred_ub)
-    out = relu_star_approx([star], relax_factor=relax_factor, lp_solver=lp_solver)[0]
+    outs = relu_star_approx([star], relax_factor=relax_factor, lp_solver=lp_solver)
+    if len(outs) != 1:
+        # Dropping any piece would under-approximate the reachable set.
+        raise RuntimeError(f"approx-star ReLU returned {len(outs)} sets; expected 1")
+    out = outs[0]
     K_out = out.V.shape[1]
     return (out.V.reshape(rows, cols, K_out),
             out.C, out.d, out.predicate_lb, out.predicate_ub)
@@ -201,12 +205,18 @@ def gine_graph_star(
         edge_weights: Optional per-edge aggregation weights (m,); defaults to 1.
         variant: 'hugine' (gine_pretrain) or 'pyg' (gine_conv).
         apply_output_relu: Apply a ReLU after MLP2 (hugine intermediate layers).
+        relax_factor: Must be > 0; ``relax_factor=0`` selects exact ReLU
+            splitting in :func:`relu_star_approx`, which GINE does not support.
 
     Returns:
         Output GraphStar with feature dimension F_out.
     """
     if not isinstance(in_set, GraphStar):
         raise TypeError(f"gine_graph_star expects GraphStar, got {type(in_set).__name__}")
+    if relax_factor == 0.0:
+        raise ValueError(
+            "GINE reach supports approx-star only; relax_factor=0 selects exact "
+            "ReLU splitting")
 
     N, F_in, K_in = in_set.V.shape
     edge_perturbed = isinstance(E, GraphStar)

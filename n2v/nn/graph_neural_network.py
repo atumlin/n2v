@@ -29,27 +29,52 @@ from n2v.nn.layer_ops.sage_reach import sage_graph_star, sage_evaluate
 from n2v.nn.layer_ops.gine_reach import gine_graph_star, gine_evaluate
 
 
+def _single(sets: List[GraphStar], what: str) -> GraphStar:
+    """Return the only set, refusing to silently pick one of several.
+
+    Exact reach yields a union of GraphStars; taking any one of them would
+    under-approximate the reachable set.
+    """
+    if len(sets) != 1:
+        raise ValueError(
+            f"{what} holds {len(sets)} GraphStars (exact reach yields a union); "
+            f"use the list attribute instead")
+    return sets[0]
+
+
 @dataclass
 class VerifyResult:
     """Verdict from :meth:`GraphNeuralNetwork.verify`."""
     status: str                              # 'verified' | 'falsified' | 'unknown'
-    reach_set: "GraphStar" = None
+    reach_sets: List[GraphStar] = None       # output reach set = union of these
     counterexample: "FalsifyResult" = None   # populated when status == 'falsified'
+
+    @property
+    def reach_set(self) -> GraphStar:
+        """The output reach set when it is a single GraphStar (approx reach)."""
+        return _single(self.reach_sets, "VerifyResult.reach_sets")
 
 
 @dataclass
 class SubgraphResult:
     """Per-target output of :meth:`GraphNeuralNetwork.reach_subgraph`."""
     target_node: int          # original 0-indexed node
-    target_local_idx: int     # its row index within ``output``
-    output: GraphStar         # reach set over the subgraph nodes
+    target_local_idx: int     # its row index within each output set
+    outputs: List[GraphStar]  # reach set over the subgraph nodes = union of these
     n_sub_nodes: int
     n_sub_edges: int
 
+    @property
+    def output(self) -> GraphStar:
+        """The reach set when it is a single GraphStar (approx reach)."""
+        return _single(self.outputs, "SubgraphResult.outputs")
+
     def target_ranges(self, **kwargs):
-        """(lb, ub) feature vectors for the target node only."""
-        lb, ub = self.output.get_ranges(**kwargs)
-        return lb[self.target_local_idx], ub[self.target_local_idx]
+        """(lb, ub) feature vectors for the target node only (hull over all outputs)."""
+        ranges = [s.get_ranges(**kwargs) for s in self.outputs]
+        lb = np.min([r[0][self.target_local_idx] for r in ranges], axis=0)
+        ub = np.max([r[1][self.target_local_idx] for r in ranges], axis=0)
+        return lb, ub
 
 
 class GraphNeuralNetwork:
@@ -166,17 +191,24 @@ class GraphNeuralNetwork:
 
         Args:
             input_set: Input GraphStar over node features.
-            method: 'approx' (triangle-relaxation ReLU; single set) — the only
-                mode wired for GNNs today.
-            relax_factor / lp_solver: forwarded to the ReLU relaxation.
+            method: 'approx' (triangle-relaxation ReLU; one set) or 'exact'
+                (ReLU splitting; a union of up to 2^k sets for k sign-crossing
+                neurons).  'exact' is supported for GCN and SAGE only.
+            relax_factor / lp_solver: forwarded to the ReLU relaxation.  As in
+                :func:`relu_star_approx`, ``relax_factor=0`` under 'approx'
+                means exact splitting (so it is rejected for GINE too).
 
         Returns:
-            List of output GraphStars (length 1 under approx-star).
+            List of output GraphStars whose union is the reach set (length 1
+            under approx-star).
         """
         if not isinstance(input_set, GraphStar):
             raise TypeError(f"reach expects a GraphStar, got {type(input_set).__name__}")
-        if method != "approx":
-            raise ValueError(f"GNN reach supports method='approx' only; got '{method}'")
+        if method not in ("approx", "exact"):
+            raise ValueError(f"GNN reach supports method='approx' or 'exact'; got '{method}'")
+        if self.layer_kind == "GINELayerSpec" and (method == "exact" or relax_factor == 0.0):
+            raise ValueError(
+                "GINE reach supports approx-star only (method='approx', relax_factor > 0)")
 
         n = self.num_layers
         sets: List[GraphStar] = [input_set]
@@ -184,12 +216,12 @@ class GraphNeuralNetwork:
             if isinstance(layer, GCNLayerSpec):
                 sets = [gcn_graph_star(s, layer.W, layer.b, self.adjacency) for s in sets]
                 if self.has_relu:
-                    sets = self._relu(sets, relax_factor, lp_solver)
+                    sets = self._relu(sets, method, relax_factor, lp_solver)
             elif isinstance(layer, SAGELayerSpec):
                 sets = [sage_graph_star(s, layer.W_node, layer.W_edge, layer.b, self.adjacency)
                         for s in sets]
                 if self.has_relu:
-                    sets = self._relu(sets, relax_factor, lp_solver)
+                    sets = self._relu(sets, method, relax_factor, lp_solver)
             elif isinstance(layer, GINELayerSpec):
                 out_relu = (self.gine_variant == "hugine") and (i < n - 1)
                 sets = [
@@ -203,10 +235,10 @@ class GraphNeuralNetwork:
         return sets
 
     @staticmethod
-    def _relu(sets, relax_factor, lp_solver):
+    def _relu(sets, method, relax_factor, lp_solver):
         out = []
         for s in sets:
-            out.extend(relu_graph_star(s, method="approx",
+            out.extend(relu_graph_star(s, method=method,
                                        relax_factor=relax_factor, lp_solver=lp_solver))
         return out
 
@@ -219,33 +251,37 @@ class GraphNeuralNetwork:
         spec_ub: np.ndarray,
         target_nodes: Optional[Sequence[int]] = None,
         falsify: bool = True,
+        method: str = "approx",
         relax_factor: float = 0.5,
         lp_solver: str = "default",
         **falsify_kwargs,
     ) -> "VerifyResult":
         """Verify outputs stay in [spec_lb, spec_ub]; falsify the 'unknown' gap.
 
-        Runs sound reachability first.  If the reach set proves the box holds,
-        returns 'verified'.  Otherwise (when ``falsify``) searches the input box
-        for a concrete counterexample; a hit returns 'falsified' with a witness,
-        a miss returns 'unknown'.
+        Runs sound reachability first.  If every output reach set proves the
+        box holds, returns 'verified'.  Otherwise (when ``falsify``) searches
+        the input box for a concrete counterexample; a hit returns 'falsified'
+        with a witness, a miss returns 'unknown'.
 
         ``input_set`` must be a box GraphStar (built via ``from_bounds``); its
         own range supplies the input box handed to the falsifier.
+        ``method`` / ``relax_factor`` / ``lp_solver`` are forwarded to
+        :meth:`reach`.
         """
         from n2v.utils.gnn_verify import verify_node_bounds
 
-        out = self.reach(input_set, relax_factor=relax_factor, lp_solver=lp_solver)[0]
-        status = verify_node_bounds([out], spec_lb, spec_ub, target_nodes)
+        outs = self.reach(input_set, method=method,
+                          relax_factor=relax_factor, lp_solver=lp_solver)
+        status = verify_node_bounds(outs, spec_lb, spec_ub, target_nodes)
         if status == "verified" or not falsify:
-            return VerifyResult(status=status, reach_set=out)
+            return VerifyResult(status=status, reach_sets=outs)
 
         in_lb, in_ub = input_set.get_ranges()
         res = falsify_node_bounds(self.evaluate, in_lb, in_ub, spec_lb, spec_ub,
                                   target_nodes=target_nodes, **falsify_kwargs)
         if res.found:
-            return VerifyResult(status="falsified", reach_set=out, counterexample=res)
-        return VerifyResult(status="unknown", reach_set=out)
+            return VerifyResult(status="falsified", reach_sets=outs, counterexample=res)
+        return VerifyResult(status="unknown", reach_sets=outs)
 
     # --------------------------------------------------------- subgraph reach
 
@@ -295,9 +331,9 @@ class GraphNeuralNetwork:
                 sub_net = GraphNeuralNetwork(self.layers, adjacency=sub_A, has_relu=self.has_relu)
                 n_sub_edges = int(np.count_nonzero(sub_A)) - len(sub_nodes)
 
-            out = sub_net.reach(sub_gs, method=method,
-                                relax_factor=relax_factor, lp_solver=lp_solver)[0]
+            outs = sub_net.reach(sub_gs, method=method,
+                                 relax_factor=relax_factor, lp_solver=lp_solver)
             results.append(SubgraphResult(
-                target_node=int(t), target_local_idx=t_local, output=out,
+                target_node=int(t), target_local_idx=t_local, outputs=outs,
                 n_sub_nodes=len(sub_nodes), n_sub_edges=n_sub_edges))
         return results

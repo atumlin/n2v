@@ -55,13 +55,12 @@ def test_synthetic_sage_wrapper_matches_layer_ops():
         assert np.all(net.evaluate(Xi) <= oub + 1e-7)
 
 
-def test_reach_rejects_non_approx_method():
-    rng = np.random.default_rng(1)
+def test_reach_rejects_unknown_method():
     net = GraphNeuralNetwork([SAGELayerSpec(np.eye(2), np.eye(2), None)],
                              adjacency=np.eye(3))
     gs = GraphStar.from_bounds(np.zeros((3, 2)), np.ones((3, 2)), adjacency=np.eye(3))
     with pytest.raises(ValueError):
-        net.reach(gs, method="exact")
+        net.reach(gs, method="abstract")
 
 
 @pytest.mark.parametrize("name", list(CHECKPOINTS))

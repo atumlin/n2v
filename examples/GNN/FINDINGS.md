@@ -161,6 +161,17 @@ The pipeline is now import -> spec -> reach -> verify -> **falsify** -> scale.
 It remains sound-but-incomplete (no exact-star GNN reach), but "unknown" cases
 now get a counterexample search instead of a dead end.
 
+**Exact reach for GCN/SAGE (2026-09-29).**  `reach`/`verify`/`reach_subgraph`
+accept `method='exact'` for GCN and SAGE: ReLU splitting yields a union of
+GraphStars, and every consumer now uses the whole union (`VerifyResult.reach_sets`,
+`SubgraphResult.outputs`).  This fixed a soundness hole: `relax_factor=0`
+already selected exact splitting inside `relu_star_approx`, but `verify` and
+`reach_subgraph` kept only `reach(...)[0]`, so a spec satisfied by one piece
+could be reported 'verified' while real outputs violated it.  GINE stays
+approx-star only and rejects `method='exact'` / `relax_factor=0` (its per-layer
+ReLUs previously dropped all but the first piece).  Regression tests in
+`tests/unit/test_gnn_exact_reach.py`.
+
 ### Test totals
 - 31 GraphStar/GCN/pool unit tests in `tests/unit/`.
 - 13 sample-and-contain soundness tests in `tests/soundness/test_soundness_gcn.py`.
