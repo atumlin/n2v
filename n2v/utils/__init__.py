@@ -24,6 +24,13 @@ from n2v.utils.gnn_loader import (
     load_gnn_mat, GNNModel, GCNModel,
     GCNLayerSpec, SAGELayerSpec, GINELayerSpec, NormStats,
 )
+from n2v.utils.gnn_verify import (
+    verify_graph_output, verify_node_bounds,
+    box_violation_halfspaces, graph_output_index,
+)
+from n2v.utils.subgraph import khop_subgraph_matrix, khop_subgraph_edges
+from n2v.utils.gnn_pyg import convert_pyg
+from n2v.utils.gnn_falsify import falsify_node_bounds, FalsifyResult
 
 __all__ = [
     "solve_lp",
@@ -44,4 +51,13 @@ __all__ = [
     "SAGELayerSpec",
     "GINELayerSpec",
     "NormStats",
+    "verify_graph_output",
+    "verify_node_bounds",
+    "box_violation_halfspaces",
+    "graph_output_index",
+    "khop_subgraph_matrix",
+    "khop_subgraph_edges",
+    "convert_pyg",
+    "falsify_node_bounds",
+    "FalsifyResult",
 ]
