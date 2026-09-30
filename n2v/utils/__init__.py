@@ -20,6 +20,11 @@ from n2v.utils.model_preprocessing import fuse_batchnorm, strip_final_softmax
 # use the explicit ``from n2v.utils.verify_specification import ...`` path
 # (which is what every existing caller in the tree does anyway).
 
+from n2v.utils.gnn_loader import (
+    load_gnn_mat, GNNModel, GCNModel,
+    GCNLayerSpec, SAGELayerSpec, GINELayerSpec, NormStats,
+)
+
 __all__ = [
     "solve_lp",
     "solve_lp_batch",
@@ -32,4 +37,11 @@ __all__ = [
     "Backend",
     "LPSolver",
     "resolve_lp_solver",
+    "load_gnn_mat",
+    "GNNModel",
+    "GCNModel",
+    "GCNLayerSpec",
+    "SAGELayerSpec",
+    "GINELayerSpec",
+    "NormStats",
 ]
